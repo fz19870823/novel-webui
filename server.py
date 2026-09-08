@@ -16,22 +16,36 @@ import threading
 import json
 import urllib.request
 import urllib.error
+from datetime import timedelta
 
-from flask import Flask, request, jsonify, send_from_directory, send_file
+from flask import (Flask, request, jsonify, send_from_directory, send_file,
+                   redirect, session)
 from flask_sock import Sock
 
 from config import (load_config, save_config, mask_api_key, DATA_DIR,
                     DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_CONFIRM_SECONDS)
+from auth import (has_users as auth_has_users,
+                  create_user as auth_create_user,
+                  verify_user as auth_verify_user,
+                  session_secret as auth_session_secret)
 from state import load_resume_state
 from controller import manager, LOG_RETURN
 from worker import GeneratorWorker
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 OUTPUT_NAMES = ["novel_*.txt", "log_*.txt"]
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2MB，仅 JSON 配置
+# 会话签名密钥持久化在数据目录（重启后已登录会话不失效）
+app.secret_key = auth_session_secret()
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 sock = Sock(app)
+
+# 无需登录即可访问的路径（首次初始化 / 登录页与对应 API）
+PUBLIC_PATHS = {"/setup.html", "/login.html",
+                "/api/auth_state", "/api/setup", "/api/login"}
 
 # 全局：当前 worker（同一时刻只允许一个生成任务）
 _worker = None
@@ -178,16 +192,100 @@ def _can_start() -> tuple[bool, str]:
         return True, ""
 
 
+# ═══════════ 鉴权 ═══════════
+
+@app.before_request
+def _auth_guard():
+    """统一鉴权守卫。
+
+    - 未初始化（无账号）→ 任何页面访问都被导向首次设置页
+    - 已初始化但未登录 → 页面 302 到登录页；API/WS 返回 401
+    - /ws 在握手阶段即被拒绝（401），不建立无用连接
+    """
+    p = request.path
+    if p == "/":
+        if not auth_has_users():
+            return redirect("/setup.html")
+        if not session.get("uid"):
+            return redirect("/login.html")
+        return None                      # 放行到 index()
+    if p in PUBLIC_PATHS:
+        return None
+    if session.get("uid"):
+        return None
+    if p == "/ws" or p.startswith("/api/") or p.startswith("/static/"):
+        return ("unauthorized", 401)
+    return None                          # 其它路径（404 等）交给 Flask
+
+
+@app.route("/setup.html")
+def setup_page():
+    return send_from_directory(STATIC_DIR, "setup.html")
+
+
+@app.route("/login.html")
+def login_page():
+    return send_from_directory(STATIC_DIR, "login.html")
+
+
+@app.route("/api/auth_state")
+def api_auth_state():
+    """鉴权状态探测（登录页/首次设置页/前端断线判断共用，免登录）。"""
+    return jsonify({
+        "setup_required": not auth_has_users(),
+        "authed": bool(session.get("uid")),
+        "user": session.get("uid"),
+    })
+
+
+@app.route("/api/setup", methods=["POST"])
+def api_setup():
+    """首次初始化：创建唯一管理员账号（之后此接口永久失效）。"""
+    if auth_has_users():
+        return jsonify({"ok": False, "message": "已初始化过，请直接登录"}), 400
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    confirm = data.get("confirm")
+    if confirm is not None and password != confirm:
+        return jsonify({"ok": False, "message": "两次输入的密码不一致"}), 400
+    ok, msg = auth_create_user(username, password)
+    if not ok:
+        return jsonify({"ok": False, "message": msg}), 400
+    return jsonify({"ok": True, "message": "管理员账号已创建"})
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    if not username or not password:
+        return jsonify({"ok": False, "message": "请输入账号和密码"}), 400
+    if not auth_verify_user(username, password):
+        return jsonify({"ok": False, "message": "账号或密码错误"}), 401
+    session.clear()                     # 防会话固定
+    session["uid"] = username
+    session.permanent = True
+    return jsonify({"ok": True, "user": username})
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
 # ═══════════ 前端静态 ═══════════
 
 @app.route("/")
 def index():
-    return send_from_directory(BASE_DIR, "static/index.html")
+    return send_from_directory(STATIC_DIR, "index.html")
 
 
 @app.route("/static/<path:filename>")
 def static_files(filename):
-    return send_from_directory(os.path.join(BASE_DIR, "static"), filename)
+    return send_from_directory(STATIC_DIR, filename)
 
 
 # ═══════════ API: 配置 ═══════════
@@ -429,6 +527,9 @@ def main():
 
     manager._confirm_seconds = args.confirm
     print(f"novel-webui 启动: http://{args.host}:{args.port}  确认倒计时={args.confirm}s")
+    if not auth_has_users():
+        print("⚠ 首次启动：请先打开页面完成管理员账号初始化（之后每次访问都需登录）。")
+        print("  凭据保存在数据目录，忘记密码可删除 auth_users.json 后重启重新初始化。")
     print("提示：绑定 0.0.0.0 即可局域网/远程访问；API Key 建议用环境变量 NOVEL_AI_API_KEY，避免明文落盘。")
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True,
             use_reloader=False)

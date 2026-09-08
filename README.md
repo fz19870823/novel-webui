@@ -9,9 +9,10 @@
 |---|---|---|
 | 界面 | 桌面窗口 | 浏览器（本机/局域网/远程均可） |
 | 后台运行 | 依赖窗口常开 | **后端常驻，提交任务后关闭页面也能跑完** |
-| 实时流式正文 | 窗口内 | 页面轮询实时刷新 |
+| 实时流式正文 | 窗口内 | WebSocket 实时推送刷新 |
 | 各层确认 | 模态对话框 | 页面弹窗 + 倒计时自动确认 |
 | 断点续传 | 按钮 | 一键继续上次生成 |
+| 访问控制 | 无 | **内置登录鉴权**（首次启动设置账号） |
 
 ## 快速开始
 
@@ -32,6 +33,19 @@ venv\Scripts\python server.py
 # 浏览器打开 http://127.0.0.1:8000
 ```
 
+### 首次启动（登录鉴权）
+
+服务默认开启**账号密码鉴权**：
+
+1. 首次启动后打开页面，会进入「首次初始化」页 → 设置唯一的**管理员账号密码**
+   （密码只存 hash，不落明文），保存后此步骤**永久关闭**。
+2. 此后每次访问都需登录；会话默认保持 30 天。
+3. 凭据文件 `auth_users.json` 与 session 密钥 `.session_secret` 保存在**运行期数据目录**
+   （见下方 NOVEL_DATA_DIR / Docker `/data` 卷），重启服务或容器后继续生效。
+
+忘记密码：删除数据目录里的 `auth_users.json` 后重启服务，可重新走首次初始化
+（Docker：`docker compose exec novel-webui rm /data/auth_users.json && docker compose restart novel-webui`）。
+
 ### 一键启动
 
 Windows 双击 **`start.bat`** 即可：
@@ -44,27 +58,31 @@ Windows 双击 **`start.bat`** 即可：
 ### 远程访问
 
 ```bash
-# 局域网/远程（注意：无鉴权，仅限可信网络或自行加反代鉴权）
+# 局域网/远程（内置账号鉴权；公网使用请务必设置强密码）
 venv\Scripts\python server.py --host 0.0.0.0 --port 8000
 
 # 自定义确认倒计时（秒）
 venv\Scripts\python server.py --confirm 10
 ```
 
-> ⚠️ 暴露到公网前请务必加访问鉴权（如反代 Basic Auth / 内网穿透带口令），
-> 防止他人滥用你的 API Key 造成扣费。
+> 服务内置登录鉴权（首次启动设置管理员账号）。仍建议：
+> ① 用强密码；② 公网部署叠加反代 TLS；③ 不要把 `auth_users.json` /
+> `.session_secret` 提交到任何代码仓库或镜像层。
 
 ## 项目结构
 
 ```
 novel-webui/
-├── server.py          ← Flask 服务 + 全部 API
+├── server.py          ← Flask 服务 + 全部 API + 登录鉴权守卫
+├── auth.py            ← 首次初始化 / 账号校验 / session 密钥持久化
 ├── controller.py      ← 线程安全任务中枢 / 待确认项 / 日志环形缓冲
 ├── worker.py          ← 后台生成线程（驱动 NovelGenerator）
 ├── engine.py          ← 生成引擎（复制自 novel-ai）
 ├── config.py          ← 配置管理（复制，Key 不落盘）
 ├── state.py           ← 断点管理（复制）
 ├── static/index.html  ← 单页前端
+├── static/login.html  ← 登录页
+├── static/setup.html  ← 首次初始化页
 ├── start.bat          ← 一键启动（Windows，自动开浏览器）
 ├── key.env.example    ← API Key 明文文件模板（可选，start.bat 会读取）
 ├── .gitignore
@@ -77,9 +95,11 @@ novel-webui/
 - **确认不依赖前端**：各层确认由引擎线程 `request_confirm()` 阻塞等待，二选一放行
   ——① 倒计时结束自动确认原文；② 前端在截止前提交 确认(可编辑)/重新生成/取消。
   因此即使没有任何浏览器在线，流程也会自动推进到底。
-- **纯后端完成**：生成全程在 `worker` 线程跑，Flask 只做状态存取，前端纯轮询。
+- **纯后端完成**：生成全程在 `worker` 线程跑，Flask 只做状态存取，前端经 `/ws` 实时推送。
 - **API Key 安全**：与 novel-ai 一致，Key 不写盘，优先环境变量 `NOVEL_AI_API_KEY`。
 - **同一时刻仅一个任务**：/api/start 有并发锁，防重复提交。
+- **内置鉴权**：除首次初始化/登录页与对应 4 个 API 外，所有页面、`/api/*`、`/ws`
+  均需登录（session cookie）；凭据与签名密钥落在数据目录，重启不丢。
 
 ## Docker 部署
 
@@ -99,11 +119,13 @@ docker run -d --name novel-webui -p 8000:8000 \
   ghcr.io/fz19870823/novel-webui:latest
 ```
 
-- 浏览器打开 `http://主机IP:8000`（无鉴权，公网请自行加反代鉴权）。
+- 浏览器打开 `http://主机IP:8000`，**首次访问先完成管理员账号初始化**，之后需登录。
 - API Key 建议用 `NOVEL_AI_API_KEY` 环境变量注入；页面填写则 Fernet 加密落盘到数据卷。
-- 生成的小说、断点、本地配置全部持久化在 `/data`（compose 卷 `novel_data`），
+- 生成的小说、断点、本地配置、**登录凭据**全部持久化在 `/data`（compose 卷 `novel_data`），
   升级镜像不丢数据。查看成品：`docker compose exec novel-webui ls /data`。
 - 服务健康检查：`docker inspect --format '{{.State.Health.Status}}' novel-webui`。
+- 升级后登录失效的情况：仅当你删掉了命名卷 `novel_data`（连凭据一起没了），
+  重新初始化即可；正常 `docker compose pull && docker compose up -d` 升级不受影响。
 
 ## 反向代理（WebSocket）
 
@@ -144,7 +166,11 @@ example.com {
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET  | `/` | 前端页面 |
+| GET  | `/` | 前端页面（未初始化→首次设置页，未登录→登录页） |
+| GET  | `/setup.html` · `/login.html` | 首次初始化页 · 登录页（公开） |
+| GET  | `/api/auth_state` | 鉴权状态 `{setup_required, authed}`（公开） |
+| POST | `/api/setup` | 首次初始化（仅可调用一次） |
+| POST | `/api/login` · `/api/logout` | 登录 · 退出 |
 | GET  | `/api/config` | 读取配置(不含 Key) |
 | POST | `/api/config` | 保存配置 |
 | POST | `/api/test` | 测试连接 |
@@ -157,3 +183,5 @@ example.com {
 | GET  | `/api/logs?since=N` | 增量日志 |
 | GET  | `/api/files` | 成品列表 |
 | GET  | `/api/download/xxx.txt` | 下载成品 |
+
+> 除标记「公开」的路径外，其余全部需要登录（session cookie）；`/ws` 未登录在握手阶段即拒绝。

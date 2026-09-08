@@ -122,6 +122,8 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
   <div class="logo" data-page-node-id="YiljfcHDQ6v1gUMSBtpqK9">novel-<span data-page-node-id="DLz4TpZAEunPqDlIBNLUty">webui</span></div>
   <div data-page-node-id="aIhUJDJ0vMAHGg72obYT5Y"><span class="dot" id="runDot" data-page-node-id="VSJ230iCt4UUzzbpGHr1BW"></span><span id="statusTxt" data-page-node-id="FQdiOY5IzwqLyP5cXhlFiF">未连接</span></div>
   <div id="badge" data-page-node-id="AL0rCpQysGyo5zBXgLiIDS">就绪</div>
+  <button type="button" class="btn ghost" id="btnLogout" title="退出登录"
+    style="padding:5px 12px;font-size:12px;flex:none">退出</button>
 </header>
 
 <div class="layout" data-page-node-id="yYSDEVMVqHmg9nLXo8iYUl">
@@ -225,7 +227,14 @@ let S = { running:false, stopping:false, wsUp:false, confirmTimer:null,
           confirmSeen:null, cfgLoaded:false, currentTab:'content', cfg:null, models:[],
           modelIdx:-1, lastFile:'' };
 const $ = id => document.getElementById(id);
-const api = (path, opts) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+const api = (path, opts) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts))
+  .then(r=>{
+    if(r.status===401){                       // 会话过期/未登录 → 回登录页
+      location.href='/login.html';
+      throw new Error('unauthorized');
+    }
+    return r;
+  });
 
 function toast(msg, isErr){
   const t = $('toast');
@@ -261,7 +270,14 @@ function connectWS(){
   try{ w = new WebSocket(wsUrl()); }catch(e){ scheduleReconnect(); return; }
   ws = w;
   w.onopen = ()=>{ setWsState(true); };
-  w.onclose = ()=>{ setWsState(false); scheduleReconnect(); };
+  w.onclose = ()=>{
+    setWsState(false);
+    // 断线先确认是否仍处于登录态：会话过期(401/服务端拒绝) → 跳登录页
+    fetch('/api/auth_state').then(r=>r.json()).then(s=>{
+      if(s && !s.authed){ location.href='/login.html'; return; }
+      scheduleReconnect();
+    }).catch(()=>scheduleReconnect());
+  };
   w.onerror = ()=>{ try{ w.close(); }catch(e){} };
   w.onmessage = ev=>{
     let d;
@@ -489,6 +505,10 @@ $('btnStop').onclick = async ()=>{
   toast(r.message); if(!r.ok && !r.message.includes('无运行')) toast(r.message,true);
 };
 $('btnClearLog').onclick = ()=>{ $('logView').textContent=''; };
+$('btnLogout').onclick = async ()=>{
+  try{ await fetch('/api/logout',{method:'POST'}); }catch(e){}
+  location.href='/login.html';
+};
 
 function readForm(){
   return {

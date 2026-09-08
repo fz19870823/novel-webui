@@ -10,6 +10,10 @@ novel_generator_config.json
 novel_resume_state.json
 .env
 
+# 登录鉴权凭据与 session 密钥（本地运行落在代码目录时防误提交）
+auth_users.json
+.session_secret
+
 # 生成的小说成品 / 日志
 novel_*.txt
 log_*.txt

@@ -30,7 +30,7 @@ VOLUME ["/data"]
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/config', timeout=4).status == 200 else 1)" || exit 1
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/auth_state', timeout=4).status == 200 else 1)" || exit 1
 
 USER appuser
 
