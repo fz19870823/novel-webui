@@ -1,0 +1,8 @@
+# novel-webui 依赖
+# Python 3.9+，建议 venv 安装
+# 安装:  venv\Scripts\python.exe -m pip install -r requirements.txt
+# 运行:  venv\Scripts\python.exe server.py --host 0.0.0.0 --port 8000
+
+openai==3.8.0
+flask==3.0.3
+cryptography>=42.0.0

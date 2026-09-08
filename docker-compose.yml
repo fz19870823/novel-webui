@@ -1,0 +1,19 @@
+services:
+  novel-webui:
+    # 优先用 GHCR 自动构建的镜像；本地改过代码时用 --build 重建
+    image: ghcr.io/fz19870823/novel-webui:latest
+    build:
+      context: .
+    container_name: novel-webui
+    ports:
+      - "8000:8000"
+    environment:
+      # API Key 建议在此注入（或宿主机环境变量），页面里填写的会加密存到 /data
+      NOVEL_AI_API_KEY: ${NOVEL_AI_API_KEY:-}
+    volumes:
+      # 成品小说 / 断点 / 本地配置都持久化在这个卷里，升级镜像不丢数据
+      - novel_data:/data
+    restart: unless-stopped
+
+volumes:
+  novel_data:

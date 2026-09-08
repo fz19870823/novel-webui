@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="8YUA0YzAAHggLJkCoYVUWF">
+<head data-page-node-id="W6gpQ8MrIZNktaxkqpRQC5">
+<meta charset="UTF-8" data-page-node-id="Fsb5hhU5yaVLOPrnyPwLvE">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="wEamAkpOUJYYeNABZAbGPE">
+<title>novel-webui · 小说远程生成器</title>
+<style>
+:root{
+  --bg:#0f1117; --panel:#171a23; --panel2:#1e2230; --line:#2a2f40;
+  --text:#e6e9f0; --muted:#8b93a7; --accent:#4f8cff; --accent2:#3d6fd8;
+  --ok:#34c98f; --warn:#ffb648; --err:#ff5c6c;
+  --mono:"Consolas","SF Mono",Menlo,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;overflow:hidden}
+button{font-family:inherit;cursor:pointer;border:none;border-radius:8px}
+input,textarea{font-family:inherit;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 12px;outline:none;font-size:14px;min-width:0;overflow-wrap:anywhere}
+input:focus,textarea:focus{border-color:var(--accent)}
+textarea{resize:vertical;line-height:1.6}
+
+/* ── 顶栏 ── */
+header{height:54px;display:flex;align-items:center;gap:14px;padding:0 18px;background:var(--panel);border-bottom:1px solid var(--line)}
+header .logo{font-weight:700;font-size:16px;letter-spacing:.5px}
+header .logo span{color:var(--accent)}
+header .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);margin-right:6px;display:inline-block}
+header .dot.run{background:var(--ok);box-shadow:0 0 8px var(--ok);animation:pulse 1.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+#statusTxt{color:var(--muted);font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#badge{font-size:12px;padding:4px 10px;border-radius:20px;background:var(--panel2);color:var(--muted);border:1px solid var(--line)}
+#badge.stage{color:var(--accent);border-color:var(--accent)}
+
+.layout{display:flex;height:calc(100% - 54px)}
+/* ── 左侧配置 ── */
+aside{width:340px;min-width:300px;overflow-y:auto;padding:16px;background:var(--bg);border-right:1px solid var(--line)}
+.sect{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.sect h3{font-size:13px;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:6px;font-weight:600}
+.sect h3 .num{background:var(--accent);color:#fff;width:18px;height:18px;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;font-size:11px}
+.f{display:flex;flex-direction:column;gap:6px;margin-bottom:12px;min-width:0}
+.f label{font-size:12px;color:var(--muted);overflow-wrap:anywhere;word-break:break-word}
+.row{display:flex;gap:8px;min-width:0}
+.row .f{flex:1;min-width:0}
+.hint{font-size:11px;color:var(--muted);line-height:1.5;margin-top:2px;overflow-wrap:anywhere;word-break:break-word}
+/* ── Model 自定义下拉(combobox) ── */
+.combobox{position:relative;display:flex;align-items:center}
+.combobox input{width:100%;padding-right:34px;overflow-wrap:normal;text-overflow:ellipsis}
+.cb-toggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:24px;height:24px;background:transparent;color:var(--muted);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;padding:0;line-height:1}
+.cb-toggle:hover{color:var(--text);background:var(--panel2)}
+.cb-list{position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--panel2);border:1px solid var(--line);border-radius:8px;margin:0;padding:4px;list-style:none;z-index:50;max-height:200px;overflow:auto;box-shadow:0 10px 28px rgba(0,0,0,.5)}
+.cb-list li{padding:7px 10px;border-radius:6px;font-size:13px;color:var(--text);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cb-list li:hover,.cb-list li.sel{background:var(--accent);color:#fff}
+.cb-list li.empty{color:var(--muted);cursor:default;text-align:center;background:none}
+.btn{border-radius:8px;padding:10px 14px;font-size:14px;font-weight:600;transition:.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px;min-width:0;overflow-wrap:anywhere;text-align:center;white-space:normal}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn.primary{background:var(--accent);color:#fff}
+.btn.primary:not(:disabled):hover{background:var(--accent2)}
+.btn.ok{background:#1f4f3f;color:var(--ok);border:1px solid #2e6b54}
+.btn.ok:not(:disabled):hover{background:#275c49}
+.btn.danger{background:#4a2730;color:var(--err);border:1px solid #7a3944}
+.btn.danger:not(:disabled):hover{background:#5d2f3a}
+.btn.ghost{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+.btn.ghost:hover{border-color:var(--muted)}
+.full{width:100%}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:4px}
+.g2 .btn{padding:10px 8px;font-size:13px}
+
+/* ── 主区 ── */
+main{flex:1;display:flex;flex-direction:column;min-width:0}
+.tabs{display:flex;gap:2px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--line);height:42px}
+.tab{padding:0 18px;background:none;color:var(--muted);font-size:13px;border-bottom:2px solid transparent}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab:hover{color:var(--text)}
+.view{flex:1;overflow:hidden;position:relative}
+.pane{position:absolute;inset:0;display:none;flex-direction:column}
+.pane.active{display:flex}
+.pane-head{padding:8px 16px;display:flex;gap:8px;align-items:center;justify-content:space-between}
+.pane-head .info{color:var(--muted);font-size:12px}
+pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:13px;line-height:1.7;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;color:#d7dbe6}
+#logView{color:#c7cedd;font-size:12.5px}
+#contentView{color:var(--text)}
+
+/* 进度条 */
+.progress-wrap{padding:10px 16px;border-top:1px solid var(--line);background:var(--panel)}
+.pbar{height:10px;border-radius:6px;background:var(--panel2);overflow:hidden}
+.pfill{height:100%;width:0;background:linear-gradient(90deg,var(--accent),#7fb0ff);border-radius:6px;transition:width .3s}
+.ptext{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:6px}
+
+/* ── 确认弹窗 ── */
+.mask{position:fixed;inset:0;background:rgba(0,0,0,.62);display:none;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(2px)}
+.mask.show{display:flex}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:14px;width:min(760px,92vw);max-height:86vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.m-head{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+.m-head h2{font-size:15px;flex:1}
+.countdown{background:var(--accent);color:#fff;padding:3px 10px;border-radius:14px;font-size:13px;font-family:var(--mono)}
+.m-prompt{padding:10px 20px;color:var(--warn);background:#2a2416;border-bottom:1px solid var(--line);font-size:13px;line-height:1.6;overflow-wrap:anywhere;word-break:break-word}
+.m-body{padding:16px 20px;flex:1;overflow:auto}
+.m-body textarea{width:100%;height:100%;min-height:280px;font-family:var(--mono);font-size:12.5px;line-height:1.7}
+.m-foot{padding:14px 20px;border-top:1px solid var(--line);display:flex;gap:10px;justify-content:flex-end}
+.auto-tip{font-size:12px;color:var(--muted);align-self:center;margin-right:auto}
+
+/* toast */
+#toast{position:fixed;top:66px;left:50%;transform:translateX(-50%) translateY(-20px);background:var(--panel2);border:1px solid var(--line);color:var(--text);padding:10px 18px;border-radius:8px;opacity:0;transition:.25s;z-index:99;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.4);pointer-events:none;max-width:92vw;overflow-wrap:anywhere;word-break:break-word;text-align:center}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.err{border-color:var(--err)} #toast.err::before{content:"⚠ ";color:var(--err)}
+
+.dl-list .file{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px;background:var(--panel2)}
+.dl-list .file .n{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dl-list .file .m{color:var(--muted);font-size:12px;font-family:var(--mono)}
+.dl-list .file a{color:var(--accent);font-size:13px;text-decoration:none}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
+::-webkit-scrollbar-thumb:hover{background:#3a4056}
+</style>
+</head>
+<body data-page-node-id="FMWgvCHwfinWMksxGxHeNO">
+
+<header data-page-node-id="4tdeFUA163m7yT1ZyuAf6F">
+  <div class="logo" data-page-node-id="YiljfcHDQ6v1gUMSBtpqK9">novel-<span data-page-node-id="DLz4TpZAEunPqDlIBNLUty">webui</span></div>
+  <div data-page-node-id="aIhUJDJ0vMAHGg72obYT5Y"><span class="dot" id="runDot" data-page-node-id="VSJ230iCt4UUzzbpGHr1BW"></span><span id="statusTxt" data-page-node-id="FQdiOY5IzwqLyP5cXhlFiF">未连接</span></div>
+  <div id="badge" data-page-node-id="AL0rCpQysGyo5zBXgLiIDS">就绪</div>
+</header>
+
+<div class="layout" data-page-node-id="yYSDEVMVqHmg9nLXo8iYUl">
+  <aside data-page-node-id="fdVgWFjQ2zhOy4iSwyAXTC">
+    <!-- 1. API -->
+    <div class="sect" data-page-node-id="fF2es98y4a8bKTxxlJJa1E">
+      <h3 data-page-node-id="rEkcPl0lr8UBDhYHhsL2FG"><span class="num" data-page-node-id="PHMcx4FYFlERQqob5Im6Vq">1</span> API 配置</h3>
+      <div class="f" data-page-node-id="2UojHKuTZtVDkAdt6UEO32"><label data-page-node-id="cQN98AqQDGF2HM772YwhD9">Base URL</label><input id="base_url" placeholder="https://api.x.ai/v1" data-page-node-id="PJABNsmkRnRKgi9nZQpAiI"></div>
+      <div class="f" data-page-node-id="eCCpzSmllqmhhoBBdljypn"><label data-page-node-id="LYxx70gr7spjwZW0hZBg45">API Key（不落盘，建议用环境变量 NOVEL_AI_API_KEY）</label><input id="api_key" type="password" placeholder="留空则用环境变量" data-page-node-id="Cv3BvraGMAR8zMOU6I3IDL"></div>
+      <div class="f" data-page-node-id="lTCvOxqbsZZ0GF6KSaxwGf"><label data-page-node-id="kRcirJ6COElvwsHe9UsXKa">Model</label>
+        <div class="combobox" data-page-node-id="DehbAWqRDuCd5jNUN8KZvC">
+          <input id="model" placeholder="grok-...（可下拉选择或手动输入）" autocomplete="off" data-page-node-id="DehbAWqRDuCd5jNUN8KZvC">
+          <button type="button" class="cb-toggle" id="cbToggle" title="显示全部模型" tabindex="-1" data-page-node-id="x7modelTg1">▾</button>
+          <ul class="cb-list" id="cbList" role="listbox" hidden data-page-node-id="x7modelList"></ul>
+        </div>
+        <div class="hint" id="keyHint" data-page-node-id="42J2SrhsLsQ6TMuld7RfOl"></div>
+      </div>
+      <div class="g2" data-page-node-id="WGlZMNUQueIR2VjeiENZn7">
+        <button class="btn ghost" id="btnTest" data-page-node-id="wUY3DFhH6ObW2jHYQGoTW8">测试连接</button>
+        <button class="btn ghost" id="btnModels" data-page-node-id="BZ41pwOxfy8Na35oyVgh5H">拉取模型列表</button>
+      </div>
+    </div>
+
+    <!-- 2. 设定 -->
+    <div class="sect" data-page-node-id="FAZb8FOp5xeBXVhnHHfOta">
+      <h3 data-page-node-id="e1OZO2AS2kHcVpjQarD3lE"><span class="num" data-page-node-id="LCtRRlXfzFhXFTV57brlUR">2</span> 小说设定</h3>
+      <div class="f" data-page-node-id="PjW4bNd4UBLsfdOdIzSIKl"><label data-page-node-id="WJ0phstck8PBTuVTI0hFc4">主题（一句话创意）</label><textarea id="theme" rows="3" placeholder="输入小说主题..."></textarea></div>
+      <div class="f" data-page-node-id="TK4D5lVmbShc2DeRWnGRE9"><label data-page-node-id="MslrXDaLPOEv4RqJY07GHa">要求（字数/风格/特殊需求）</label><textarea id="req" rows="5" placeholder="详细要求..."></textarea></div>
+      <div class="row" data-page-node-id="xr0crUT3OrWsT1OKUlAmjv">
+        <div class="f" data-page-node-id="dWsBbZgkliyeaR4uAAdAim"><label data-page-node-id="5vkMrRHTY6cQPaJXVtFkbj">章节数（留空自动）</label><input id="cc" type="number" min="1" placeholder="自动" data-page-node-id="hLmQvTFRJbNjJIXsMBD18T"></div>
+        <div class="f" data-page-node-id="XX605rWiSF5cGQhdpmyRvE"><label data-page-node-id="WsOqdCHdgq9Mm9y6EAATuM">每章字数（默认1200）</label><input id="wpc" type="number" min="100" placeholder="1200" data-page-node-id="KXNGQ3zotWDSQ11sBKWCRO"></div>
+      </div>
+    </div>
+
+    <!-- 3. 控制 -->
+    <div class="sect" data-page-node-id="dYGAHddOY7lLInTvez7rdx">
+      <h3 data-page-node-id="F43qxVgLAVU3V6wPDiATCd"><span class="num" data-page-node-id="fdDwLt4rK5CO58n8zOHqTH">3</span> 操作</h3>
+      <button class="btn primary full" id="btnStart" disabled data-page-node-id="NAM9uHEEHCiD1WBY29tSxk">开始生成</button>
+      <div class="g2" style="margin-top:10px" data-page-node-id="zFkPbo936UkzrLqVkeueE9">
+        <button class="btn ok" id="btnResume" disabled data-page-node-id="5gBqZymjoIuisd1Ls4pw8f">继续上次</button>
+        <button class="btn danger" id="btnStop" disabled data-page-node-id="1kXGRU5ZuQlbcq6vuMVII1">停止</button>
+      </div>
+      <div class="g2" style="margin-top:10px" data-page-node-id="ofEJNigaGfdPOOxjRmFK8y">
+        <button class="btn ghost" id="btnSaveCfg" data-page-node-id="eTAAn9mfxEGaErVJ7kyiPf">仅保存配置</button>
+        <button class="btn ghost" id="btnClearLog" data-page-node-id="sggQtcXBcOgMAylkcsCVkG">清空日志</button>
+      </div>
+    </div>
+
+    <!-- 成品 -->
+    <div class="sect" data-page-node-id="ltI3gDHEDaFwUycvDHiPdD">
+      <h3 data-page-node-id="7iMzXQkeHk3tLPcLmrkRrv">📁 已生成小说</h3>
+      <div class="dl-list" id="fileList" data-page-node-id="Qzn2Np2RoaT8gRvPbUGXg7"><div class="hint" data-page-node-id="RwQm4XdlJkg9LjcKqK8jVt">暂无</div></div>
+    </div>
+  </aside>
+
+  <main data-page-node-id="itR6oHe1RzG8MekjgctEmc">
+    <div class="tabs" data-page-node-id="eBYynj3YjV42xKdamAhZuA">
+      <button class="tab active" data-v="content" data-page-node-id="35fIaVnV7w8TvmpNufvfNg">实时正文</button>
+      <button class="tab" data-v="log" data-page-node-id="vNEyONqeKgsMOVfMwteVQd">运行日志</button>
+    </div>
+    <div class="view" data-page-node-id="g8LKEGO8sRlefIxkxnlKzg">
+      <div class="pane active" id="pane-content" data-page-node-id="FM2joyRxl56iNYISe3j2Jv">
+        <div class="pane-head" data-page-node-id="k1p8XdSTa6SgJnAomp4sFN"><span class="info" data-page-node-id="nitHni1C1yTydcX1jB5MvW">流式正文 · 尾部 <b id="contentLen" data-page-node-id="z61pt2i2GSjKt8lMQEmwC1">0</b> 字（后台生成，刷新不中断）</span></div>
+        <pre id="contentView" data-page-node-id="UiMBUBSc80cp3GmavBZqS1">尚未开始生成。提交任务后即使关闭本页面，生成也会在后端完整跑完。</pre>
+      </div>
+      <div class="pane" id="pane-log" data-page-node-id="TFBSzZEl1QqtBGME4SDD3c">
+        <div class="pane-head" data-page-node-id="rIpzfDdpV5VQnoZsjPPPuD"><span class="info" data-page-node-id="QymeCH1xWYuJgXydyqb2q9">运行日志</span></div>
+        <pre id="logView" data-page-node-id="lAFGfb8NtqrOIF9sU2lgDg"></pre>
+      </div>
+    </div>
+    <div class="progress-wrap" data-page-node-id="KYVBjECA43nJAVBpl2jwf9">
+      <div class="pbar" data-page-node-id="hpgCcVGO54cwA0D4RbCFMm"><div class="pfill" id="pfill" data-page-node-id="tUHfYC2nFwMEvcHR0iBx79"></div></div>
+      <div class="ptext" data-page-node-id="xCIBhSrVTzkVyJqCAuHGdA"><span id="pLabel" data-page-node-id="30n1XrgilUqTTOaJEOK1dG">就绪</span><span id="pVal" data-page-node-id="LuMr5sQGkdoUGv7haoQWQz">0%</span></div>
+    </div>
+  </main>
+</div>
+
+<!-- 确认弹窗 -->
+<div class="mask" id="mask" data-page-node-id="Zf2SEdQT9LpR8vSKEtrE4Q">
+  <div class="modal" data-page-node-id="dFzXYOAy1j2VMDmHA8utYy">
+    <div class="m-head" data-page-node-id="Z9SWSgkFMWCHoQhKBu5WgH">
+      <h2 id="cTitle" data-page-node-id="3J302FFiCuAWBlHfWdVO6f">确认</h2>
+      <span class="countdown" id="cCount" data-page-node-id="mcrfdRabWForEGYw13XHO7">5s</span>
+    </div>
+    <div class="m-prompt" id="cPrompt" data-page-node-id="oHxTnJHBabuO2XHFwiQlmu"></div>
+    <div class="m-body" data-page-node-id="uHeOU5M6UaP7VrOAU6INzw"><textarea id="cText"></textarea></div>
+    <div class="m-foot" data-page-node-id="J1lbDChQeeTKHuOzjsXn3c">
+      <span class="auto-tip" id="cTip" data-page-node-id="gl5gDefdHvrrnIpGWWCqLl">倒计时结束将自动确认原文</span>
+      <button class="btn ghost" id="cCancel" data-page-node-id="ACS4qjzUJLe6eKZqfiO7b0">取消（停止生成）</button>
+      <button class="btn ghost" id="cRe" data-page-node-id="LNCyE1lhqxkVaxuK7GhD3k">重新生成</button>
+      <button class="btn primary" id="cConfirm" data-page-node-id="QkvwKnbBbT0LYB9YZVaBHB">确认使用</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" data-page-node-id="Zo8iniZHzPhEAgm4dKE1T9"></div>
+
+<script>
+// ── 常量与状态 ──
+let S = { running:false, stopping:false, logSeq:0, pollTimer:null, confirmTimer:null,
+          confirmSeen:null, cfgLoaded:false, currentTab:'content', cfg:null, models:[],
+          modelIdx:-1 };
+const $ = id => document.getElementById(id);
+const api = (path, opts) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
+
+function toast(msg, isErr){
+  const t = $('toast');
+  t.textContent = msg; t.classList.toggle('err', !!isErr);
+  t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(()=>t.classList.remove('show'), 3200);
+}
+function fmtSize(b){ if(b>1024*1024) return (b/1024/1024).toFixed(1)+'MB'; if(b>1024) return (b/1024).toFixed(1)+'KB'; return b+'B'; }
+
+// ── 配置加载/保存 ──
+async function loadCfg(){
+  const r = await api('/api/config'); const c = await r.json();
+  S.cfg = c; S.cfgLoaded = true;
+  $('base_url').value = c.base_url;
+  $('model').value = c.model;
+  $('cc').value = c.chapters_count; $('wpc').value = c.words_per_chapter;
+  $('theme').value = c.theme; $('req').value = c.requirements;
+  $('keyHint').textContent = c.api_key_env ? `🔒 已用环境变量 (${c.api_key_masked})`
+    : c.api_key_masked !== '未配置' ? `已配置 (${c.api_key_masked})，可留空` : '⚠ 未配置 Key';
+  $('btnStart').disabled = false;
+  $('btnResume').disabled = !c.has_resume;
+  refreshFiles();
+}
+
+// ── 状态轮询（主循环）──
+async function poll(){
+  if(!S.cfgLoaded) return;
+  try{
+    const st = await (await api('/api/status?since='+S.logSeq+'&content=1')).json();
+    // 日志增量
+    if(st.log_seq > S.logSeq){
+      // 需拉日志明细
+    }
+    S.logSeq = st.log_seq;
+    applyStatus(st);
+  }catch(e){ /* 服务未就绪，忽略 */ }
+}
+function applyStatus(st){
+  const badge = $('badge');
+  const dot = $('runDot');
+  S.running = st.running;
+  $('pfill').style.width = st.progress + '%';
+  $('pVal').textContent = st.progress + '%';
+  $('pLabel').textContent = (st.progress_text||st.stage_name||'') + (st.stopping?'（停止中…）':'');
+  if(st.running){ dot.className='dot run'; badge.className='stage'; badge.textContent=st.stage_name||'运行中';
+    $('btnStart').disabled=true; $('btnStop').disabled=false; $('btnResume').disabled=true;
+    if(st.stopping) $('btnStop').textContent='停止中…'; else $('btnStop').textContent='停止';
+  }else{
+    dot.className='dot';
+    if(st.stage==='done'){ badge.textContent='✅ 完成'; }
+    else if(st.last_error){ badge.className=''; badge.textContent='❌ '+st.last_error.slice(0,20); }
+    else if(st.finished){ badge.className=''; badge.textContent=st.stage_name||'已停止'; }
+    else{ badge.className=''; badge.textContent='就绪'; }
+    $('btnStart').disabled=false;
+    $('btnStop').disabled=true; $('btnStop').textContent='停止';
+    $('btnResume').disabled = !st.has_resume;
+  }
+  $('statusTxt').textContent = st.running?'后台任务运行中，可安全关闭页面':'空闲';
+  // 实时正文
+  if(st.content_tail !== undefined && st.content_tail){
+    if(S.currentTab==='content') $('contentView').textContent = st.content_tail;
+    $('contentLen').textContent = st.content_tail.length;
+  }
+  // 确认弹窗：有新的待确认项且当前没有更晚的项在展示
+  if(st.confirm && (!activeConfirm || st.confirm.id !== activeConfirm.id)){
+    openConfirm(st.confirm);
+  } else if(!st.confirm){
+    closeConfirm();
+  }
+  // 完成后刷新文件
+  if(st.result_file){ refreshFiles(); }
+}
+
+// ── 日志轮询（独立、较高频以便实时）──
+async function pollLogs(){
+  try{
+    const d = await (await api('/api/logs?since='+S.logSeq)).json();
+    if(d.logs && d.logs.length){
+      S.logSeq = d.seq;
+      const pre = $('logView');
+      for(const [,msg] of d.logs) pre.textContent += msg + '\n';
+      pre.scrollTop = pre.scrollHeight;
+      if(S.currentTab!=='log') {} // 后台累积即可
+    } else {
+      S.logSeq = d.seq;
+    }
+  }catch(e){}
+}
+
+// ── 确认弹窗逻辑 ──
+let activeConfirm = null, confirmDeadline = 0;
+function openConfirm(c){
+  activeConfirm = c; confirmDeadline = c.deadline;
+  $('cTitle').textContent = c.title;
+  $('cPrompt').textContent = c.prompt;
+  $('cText').value = c.content;
+  $('mask').classList.add('show');
+  renderCountdown();
+}
+function closeConfirm(){
+  if(activeConfirm) activeConfirm=null;
+  $('mask').classList.remove('show');
+}
+function renderCountdown(){
+  if(!activeConfirm) return;
+  const rem = Math.max(0, confirmDeadline - Date.now()/1000);
+  $('cCount').textContent = Math.ceil(rem)+'s';
+  $('cTip').textContent = rem<=0 ? '' : '倒计时结束将自动确认原文';
+  clearTimeout(activeConfirm._t);
+  activeConfirm._t = setTimeout(renderCountdown, 300);
+}
+
+async function sendConfirm(action, edited){
+  const body = {action, edited: action==='confirm' ? $('cText').value : undefined};
+  const r = await (await api('/api/confirm',{method:'POST',body:JSON.stringify(body)})).json();
+  if(!r.ok) toast(r.message,true);
+  else closeConfirm();
+}
+
+// 点击遮罩不关闭（避免误操作）；按钮操作
+$('cConfirm').onclick = ()=>sendConfirm('confirm');
+$('cRe').onclick = ()=>sendConfirm('regenerate');
+$('cCancel').onclick = ()=>sendConfirm('cancel');
+
+// ── 标签切换 ──
+document.querySelectorAll('.tab').forEach(t=>{
+  t.onclick = ()=>{
+    document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.pane').forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    S.currentTab = t.dataset.v;
+    $('pane-'+S.currentTab).classList.add('active');
+    if(S.currentTab==='content'){ /* 若停在中途，仍显示最后正文 */ }
+  };
+});
+
+// ── 操作按钮 ──
+$('btnSaveCfg').onclick = async ()=>{
+  const r = await (await api('/api/config',{method:'POST',body:JSON.stringify(readForm())})).json();
+  toast('配置已保存'); await loadCfg();
+};
+$('btnTest').onclick = async ()=>{
+  const f = readForm();
+  if(!$('api_key').value && !(S.cfg&&S.cfg.api_key_env) && !(S.cfg&&S.cfg.api_key_masked!=='未配置')) return toast('请填写 API Key',true);
+  toast('正在测试连接…');
+  const r = await (await api('/api/test',{method:'POST',body:JSON.stringify(f)})).json();
+  r.ok?toast('连接成功：'+r.message):toast(r.message,true);
+};
+$('btnModels').onclick = async ()=>{
+  const f = readForm();
+  toast('拉取模型列表…');
+  const r = await (await api('/api/models',{method:'POST',body:JSON.stringify(f)})).json();
+  if(!r.ok) return toast(r.message,true);
+  const raw = (r.models||[]).filter(Boolean);
+  // 去重
+  const seen = new Set();
+  S.models = raw.filter(m=>seen.has(m)?false:(seen.add(m),true));
+  // 当前输入为空时，默认选中第一个
+  if(!$('model').value.trim() && S.models.length) $('model').value = S.models[0];
+  openModelList('');   // 拉取后直接展开下拉列表
+};
+
+// ── Model 下拉(自定义，不受浏览器过滤，可完整展示 + 手动输入) ──
+const modelInput = $('model'), cbList = $('cbList');
+function renderModelList(filter){
+  const kw = (filter||'').trim().toLowerCase();
+  const list = kw ? S.models.filter(m=>m.toLowerCase().includes(kw)) : S.models;
+  cbList.innerHTML = '';
+  S.modelIdx = -1;
+  if(!list.length){
+    const li = document.createElement('li');
+    li.className = 'empty';
+    li.textContent = S.models.length ? '无匹配模型' : '（尚未拉取，点"拉取模型列表"）';
+    cbList.appendChild(li);
+    return;
+  }
+  list.forEach(m=>{
+    const li = document.createElement('li');
+    li.textContent = m; li.dataset.val = m;
+    li.addEventListener('mousedown', e=>{ e.preventDefault(); selectModel(m); });
+    cbList.appendChild(li);
+  });
+  // 记录当前完整(过滤后)列表供键盘导航
+  S._curList = list;
+}
+function selectModel(m){
+  modelInput.value = m;
+  closeModelList();
+}
+function openModelList(filter){
+  renderModelList(filter||modelInput.value);
+  cbList.hidden = false;
+}
+function closeModelList(){
+  cbList.hidden = true; S.modelIdx = -1;
+}
+$('cbToggle').onclick = e=>{
+  e.stopPropagation();
+  if(cbList.hidden){
+    modelInput.value = '';            // 清空当前内容，便于手动输入后过滤查找
+    renderModelList('');
+    cbList.hidden = false;
+    modelInput.focus();
+  } else closeModelList();
+};
+modelInput.addEventListener('focus', ()=>{ renderModelList(''); cbList.hidden=false; });
+modelInput.addEventListener('input', ()=>{ if(!cbList.hidden) renderModelList(modelInput.value); });
+modelInput.addEventListener('click', ()=>{ if(cbList.hidden){ renderModelList(''); cbList.hidden=false; } });
+modelInput.addEventListener('keydown', e=>{
+  if(e.key==='Escape'){ closeModelList(); return; }
+  if(e.key==='ArrowDown'||e.key==='ArrowUp'){
+    e.preventDefault();
+    if(cbList.hidden) openModelList('');
+    const items = cbList.querySelectorAll('li:not(.empty)');
+    if(!items.length) return;
+    const d = e.key==='ArrowDown'?1:-1;
+    S.modelIdx = (S.modelIdx + d + items.length) % items.length;
+    items.forEach((li,i)=>li.classList.toggle('sel', i===S.modelIdx));
+    if(S.modelIdx>=0) items[S.modelIdx].scrollIntoView({block:'nearest'});
+    return;
+  }
+  if(e.key==='Enter'){
+    if(cbList.hidden) return;
+    const items2 = cbList.querySelectorAll('li:not(.empty)');
+    if(S.modelIdx>=0 && items2[S.modelIdx]){ selectModel(items2[S.modelIdx].dataset.val); }
+    else if(items2.length===1){ selectModel(items2[0].dataset.val); }
+  }
+});
+document.addEventListener('click', e=>{
+  if(!e.target.closest('.combobox')) closeModelList();
+});
+$('btnStart').onclick = async ()=>{
+  if(!S.cfgLoaded) return;
+  const f = readForm();
+  if(!f.theme.trim()) return toast('请输入小说主题',true);
+  if(!f.api_key && !(S.cfg&&(S.cfg.api_key_env||S.cfg.api_key_masked!=='未配置'))) return toast('请填写 API Key',true);
+  const r = await (await api('/api/start',{method:'POST',body:JSON.stringify(f)})).json();
+  if(r.ok){ toast('🚀 任务已启动'); resetViews(); loadCfg(); } else toast(r.message,true);
+};
+$('btnResume').onclick = async ()=>{
+  const r = await (await api('/api/resume',{method:'POST',body:JSON.stringify(readForm())})).json();
+  if(r.ok){ toast(r.message); resetViews(); } else toast(r.message,true);
+};
+$('btnStop').onclick = async ()=>{
+  const r = await (await api('/api/stop',{method:'POST'})).json();
+  toast(r.message); if(!r.ok && !r.message.includes('无运行')) toast(r.message,true);
+};
+$('btnClearLog').onclick = ()=>{ $('logView').textContent=''; };
+
+function readForm(){
+  return {
+    api_key: $('api_key').value,
+    base_url: $('base_url').value,
+    model: $('model').value,
+    theme: $('theme').value,
+    requirements: $('req').value,
+    chapters_count: $('cc').value,
+    words_per_chapter: $('wpc').value,
+  };
+}
+function resetViews(){
+  $('contentView').textContent='任务已启动，等待生成…';
+  $('logView').textContent='';
+  S.logSeq=0;
+}
+
+// ── 成品文件列表 ──
+async function refreshFiles(){
+  try{
+    const d = await (await api('/api/files')).json();
+    const el = $('fileList');
+    if(!d.files.length){ el.innerHTML='<div class="hint">暂无成品</div>'; return; }
+    el.innerHTML = d.files.map(f=>
+      `<div class="file"><span class="n">📄 ${f.name}</span>
+       <span class="m">${fmtSize(f.size)}</span>
+       <a href="/api/download/${encodeURIComponent(f.name)}">下载</a></div>`
+    ).join('');
+  }catch(e){}
+}
+
+// ── 启动 ──
+loadCfg();
+setInterval(poll, 800);
+setInterval(pollLogs, 1000);
+setInterval(refreshFiles, 5000);
+</script>
+</body>
+</html>

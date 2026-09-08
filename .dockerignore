@@ -1,0 +1,29 @@
+# VCS / CI
+.git
+.gitignore
+.github
+
+# 本地环境
+venv
+__pycache__
+*.pyc
+*.pyo
+
+# 密钥与本地配置（绝不进镜像）
+key.env
+key.env.example
+.model_secret
+novel_generator_config.json
+novel_resume_state.json
+.env
+
+# 生成的小说成品 / 日志（含中文文件名，如 超能情人_20260908_172555.txt）
+novel_*.txt
+log_*.txt
+*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].txt
+
+# Docker 编排自身
+Dockerfile
+.dockerignore
+docker-compose.yml
+start.bat
