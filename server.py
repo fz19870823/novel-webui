@@ -34,7 +34,15 @@ from worker import GeneratorWorker
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-OUTPUT_NAMES = ["novel_*.txt", "log_*.txt"]
+
+# 成品/日志文件名判定：worker 落盘为「标题_YYYYMMDD_HHMMSS.txt」(标题可中文)，
+# 兼容旧式 novel_*.txt / log_*.txt 前缀命名。用于文件列表与下载白名单。
+import re as _re
+_OUTPUT_NAME_RE = _re.compile(r"^(?:novel_|log_|.+(?:_\d{8}_\d{6}))\.txt$")
+
+
+def is_output_name(fn: str) -> bool:
+    return bool(_OUTPUT_NAME_RE.match(fn or ""))
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2MB，仅 JSON 配置
@@ -491,10 +499,10 @@ def api_logs():
 
 @app.route("/api/files")
 def api_files():
-    """列出数据目录里生成的 novel_*.txt 成品，供下载。"""
+    """列出数据目录里的生成成品（标题_时间戳.txt / novel_*.txt / log_*.txt），供下载。"""
     files = []
     for fn in sorted(os.listdir(DATA_DIR)):
-        if fn.startswith("novel_") and fn.endswith(".txt"):
+        if is_output_name(fn):
             p = os.path.join(DATA_DIR, fn)
             files.append({"name": fn, "size": os.path.getsize(p),
                           "mtime": os.path.getmtime(p)})
@@ -504,13 +512,16 @@ def api_files():
 
 @app.route("/api/download/<path:filename>")
 def api_download(filename: str):
-    # 只允许 novel_*.txt / log_*.txt 类产物，防路径穿越
+    # 只允许生成的成品/日志（中文标题_时间戳.txt 或 novel_/log_ 前缀），防路径穿越
     name = os.path.basename(filename)
-    if not (name.startswith("novel_") or name.startswith("log_")) or not name.endswith(".txt"):
+    if not is_output_name(name):
         return "forbidden", 403
     p = os.path.join(DATA_DIR, name)
     if not os.path.exists(p):
         return "not found", 404
+    # 双保险：确认解析后仍在数据目录内（防符号链接逃逸）
+    if not os.path.realpath(p).startswith(os.path.realpath(DATA_DIR) + os.sep):
+        return "forbidden", 403
     return send_file(p, as_attachment=True, download_name=name)
 
 
