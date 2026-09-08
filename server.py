@@ -2,10 +2,12 @@
 novel-webui 服务入口
 Flask 提供：
   - 前端静态页（/）
-  - API：配置读写/测试连接/拉模型 / 启动/续传/停止 / 状态轮询 / 确认应答 / 下载成品
+  - API：配置读写/测试连接/拉模型 / 启动/续传/停止 / 状态拉取(兼容) / 确认应答 / 下载成品
+  - WebSocket /ws：状态/日志/实时正文/待确认项推送（前端实时显示主通道）
 生成任务在后台线程运行，不依赖前端连接，提交后即可关闭页面。
 
 用法： python server.py [--host 127.0.0.1] [--port 8000] [--confirm 5]
+WS 经反向代理时：反代需转发 Upgrade/Connection 头（见 README「反向代理」一节）。
 """
 
 import argparse
@@ -16,11 +18,12 @@ import urllib.request
 import urllib.error
 
 from flask import Flask, request, jsonify, send_from_directory, send_file
+from flask_sock import Sock
 
 from config import (load_config, save_config, mask_api_key, DATA_DIR,
                     DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_CONFIRM_SECONDS)
 from state import load_resume_state
-from controller import manager
+from controller import manager, LOG_RETURN
 from worker import GeneratorWorker
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,10 +31,119 @@ OUTPUT_NAMES = ["novel_*.txt", "log_*.txt"]
 
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2MB，仅 JSON 配置
+sock = Sock(app)
 
 # 全局：当前 worker（同一时刻只允许一个生成任务）
 _worker = None
 _worker_lock = threading.Lock()
+
+# ── WebSocket 订阅端（/ws）──
+WS_HEARTBEAT = 15          # 秒：空闲时发送 ping 保活（反代 read_timeout 默认常为 60s）
+WS_RECEIVE_TIMEOUT = 30    # 秒：服务端 receive 阻塞上限
+_ws_clients = set()        # WsClient 集合
+_ws_clients_lock = threading.Lock()
+
+
+class WsClient:
+    """单条 /ws 连接。记录已推送的 rev/日志 seq/正文长度，用于增量 diff。"""
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.rev = -1      # 已推状态 rev（-1 = 尚未推 init）
+        self.seq = 0       # 已推日志 seq
+        self.clen = -1     # 已推正文尾长度（-1 = 尚未推）
+        self.alive = True
+
+    def close(self):
+        self.alive = False
+        with manager._cond:
+            manager._cond.notify_all()
+
+
+def _ws_send(cli: WsClient, obj: dict) -> bool:
+    """发送一帧；失败(连接已断)返回 False。send 线程安全（simple-websocket）。"""
+    try:
+        cli.ws.send(json.dumps(obj, ensure_ascii=False))
+        return True
+    except Exception:
+        return False
+
+
+def _ws_tick(cli: WsClient) -> bool:
+    """单次 diff 计算与推送。返回 False 表示连接已断，应结束订阅线程。"""
+    st = manager.get_status()
+    rev, seq = st.pop("rev"), st["log_seq"]
+
+    if cli.rev < 0:
+        # 首次连接：全量 init（状态 + 最近日志 + 正文尾），不等心跳周期
+        logs = manager.get_logs_since(0)["logs"][-LOG_RETURN:]
+        content = manager.get_content_tail()
+        cli.rev, cli.seq, cli.clen = rev, seq, len(content)
+        return _ws_send(cli, {"type": "init", "status": st,
+                              "logs": [m for _, m in logs],
+                              "content": content})
+
+    frame: dict = {"type": "diff"}
+    changed = False
+    if rev != cli.rev:
+        cli.rev = rev
+        frame["status"] = st
+        changed = True
+    if seq != cli.seq:
+        d = manager.get_logs_since(cli.seq)
+        frame["logs"] = [m for _, m in d["logs"]]
+        frame["seq"] = d["seq"]
+        cli.seq = d["seq"]
+        changed = True
+    clen = len(manager.get_content_tail())
+    if clen != cli.clen:
+        cli.clen = clen
+        frame["content"] = manager.get_content_tail()
+        changed = True
+    if changed:
+        return _ws_send(cli, frame)
+    # 无变化：心跳保活（反代 / 中间层空闲断连）
+    return _ws_send(cli, {"type": "ping"})
+
+
+def _ws_sender(cli: WsClient):
+    """订阅线程：先立即推一轮(含 init)，此后等变更通知 → 增量 diff；空闲发心跳。"""
+    try:
+        while cli.alive:
+            if not _ws_tick(cli):
+                return
+            with manager._cond:
+                manager._cond.wait(timeout=WS_HEARTBEAT)
+    finally:
+        cli.close()
+
+
+@sock.route("/ws")
+def ws_handler(ws):
+    """/ws：浏览器订阅端。连接建立即推 init，此后 manager 变更推送 diff。"""
+    cli = WsClient(ws)
+    with _ws_clients_lock:
+        _ws_clients.add(cli)
+    threading.Thread(target=_ws_sender, args=(cli,), daemon=True).start()
+    try:
+        while True:
+            msg = ws.receive(timeout=WS_RECEIVE_TIMEOUT)
+            if msg is None:
+                continue  # receive 超时，非断开
+            try:
+                obj = json.loads(msg)
+            except (ValueError, TypeError):
+                continue
+            t = obj.get("type") if isinstance(obj, dict) else None
+            if t == "ping":        # 浏览器侧探测存活
+                _ws_send(cli, {"type": "pong"})
+            # 其余消息当前无客户端→服务端语义，忽略
+    except Exception:
+        pass  # 连接关闭/异常 → 清理
+    finally:
+        cli.close()
+        with _ws_clients_lock:
+            _ws_clients.discard(cli)
 
 
 def _stage_info():

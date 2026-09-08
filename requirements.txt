@@ -5,4 +5,5 @@
 
 openai==3.8.0
 flask==3.0.3
+flask-sock==0.7.0
 cryptography>=42.0.0

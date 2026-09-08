@@ -26,6 +26,7 @@ header .logo{font-weight:700;font-size:16px;letter-spacing:.5px}
 header .logo span{color:var(--accent)}
 header .dot{width:9px;height:9px;border-radius:50%;background:var(--muted);margin-right:6px;display:inline-block}
 header .dot.run{background:var(--ok);box-shadow:0 0 8px var(--ok);animation:pulse 1.2s infinite}
+header .dot.err{background:var(--err);box-shadow:0 0 8px var(--err)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 #statusTxt{color:var(--muted);font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #badge{font-size:12px;padding:4px 10px;border-radius:20px;background:var(--panel2);color:var(--muted);border:1px solid var(--line)}
@@ -108,6 +109,8 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 .dl-list .file .n{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dl-list .file .m{color:var(--muted);font-size:12px;font-family:var(--mono)}
 .dl-list .file a{color:var(--accent);font-size:13px;text-decoration:none}
+.sect h3 .mini-btn{background:none;border:none;color:var(--muted);cursor:pointer;font-size:15px;line-height:1;margin-left:auto;padding:0 4px}
+.sect h3 .mini-btn:hover{color:var(--accent)}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
 ::-webkit-scrollbar-thumb:hover{background:#3a4056}
@@ -169,7 +172,7 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 
     <!-- 成品 -->
     <div class="sect" data-page-node-id="ltI3gDHEDaFwUycvDHiPdD">
-      <h3 data-page-node-id="7iMzXQkeHk3tLPcLmrkRrv">📁 已生成小说</h3>
+      <h3 data-page-node-id="7iMzXQkeHk3tLPcLmrkRrv">📁 已生成小说<button class="mini-btn" id="btnRefreshFiles" title="刷新成品列表" data-page-node-id="miniRefresh">⟳</button></h3>
       <div class="dl-list" id="fileList" data-page-node-id="Qzn2Np2RoaT8gRvPbUGXg7"><div class="hint" data-page-node-id="RwQm4XdlJkg9LjcKqK8jVt">暂无</div></div>
     </div>
   </aside>
@@ -218,9 +221,9 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 
 <script>
 // ── 常量与状态 ──
-let S = { running:false, stopping:false, logSeq:0, pollTimer:null, confirmTimer:null,
+let S = { running:false, stopping:false, wsUp:false, confirmTimer:null,
           confirmSeen:null, cfgLoaded:false, currentTab:'content', cfg:null, models:[],
-          modelIdx:-1 };
+          modelIdx:-1, lastFile:'' };
 const $ = id => document.getElementById(id);
 const api = (path, opts) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts));
 
@@ -246,31 +249,70 @@ async function loadCfg(){
   refreshFiles();
 }
 
-// ── 状态轮询（主循环）──
-async function poll(){
-  if(!S.cfgLoaded) return;
-  try{
-    const st = await (await api('/api/status?since='+S.logSeq+'&content=1')).json();
-    // 日志增量
-    if(st.log_seq > S.logSeq){
-      // 需拉日志明细
-    }
-    S.logSeq = st.log_seq;
-    applyStatus(st);
-  }catch(e){ /* 服务未就绪，忽略 */ }
+// ── WebSocket 实时推送（替代原 800ms status + 1s logs + 5s files 三个 GET 轮询）──
+let ws = null;
+function wsUrl(){
+  // 相对协议/主机：直接走 http(s) 同源路径，反代（nginx/caddy/CF）后自动变成 wss
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  return proto + location.host + '/ws';
+}
+function connectWS(){
+  let w;
+  try{ w = new WebSocket(wsUrl()); }catch(e){ scheduleReconnect(); return; }
+  ws = w;
+  w.onopen = ()=>{ setWsState(true); };
+  w.onclose = ()=>{ setWsState(false); scheduleReconnect(); };
+  w.onerror = ()=>{ try{ w.close(); }catch(e){} };
+  w.onmessage = ev=>{
+    let d;
+    try{ d = JSON.parse(ev.data); }catch(e){ return; }
+    if(!d || !d.type) return;
+    if(d.type === 'init' || d.type === 'diff') handlePush(d);
+    else if(d.type === 'ping'){ try{ ws.send(JSON.stringify({type:'pong'})); }catch(e){} }
+  };
+}
+function scheduleReconnect(){
+  clearTimeout(scheduleReconnect._t);
+  scheduleReconnect._t = setTimeout(connectWS, 2000);
+}
+function setWsState(up){
+  S.wsUp = !!up;
+  const dot = $('runDot');
+  dot.className = 'dot' + (S.running ? ' run' : '') + (S.wsUp ? '' : ' err');
+  $('statusTxt').textContent = S.wsUp
+    ? (S.running ? '后台任务运行中，实时推送' : '空闲')
+    : '连接中断，自动重连中…';
+}
+function handlePush(d){
+  if(d.status) applyStatus(d.status);
+  if(d.logs && d.logs.length) appendLogs(d.logs);
+  if(d.status && d.status.result_file && d.status.result_file !== S.lastFile){
+    S.lastFile = d.status.result_file; refreshFiles();
+  }
+  if(typeof d.content === 'string') applyContent(d.content);
+}
+function applyContent(tail){
+  if(!tail) return;   // 空内容（如新任务刚启动）由占位提示接管
+  if(S.currentTab === 'content') $('contentView').textContent = tail;
+  $('contentLen').textContent = tail.length;
+}
+function appendLogs(logs){
+  const pre = $('logView');
+  for(const m of logs){ pre.textContent += m + '\n'; }
+  pre.scrollTop = pre.scrollHeight;
 }
 function applyStatus(st){
   const badge = $('badge');
-  const dot = $('runDot');
   S.running = st.running;
+  S.stopping = !!st.stopping;
   $('pfill').style.width = st.progress + '%';
   $('pVal').textContent = st.progress + '%';
   $('pLabel').textContent = (st.progress_text||st.stage_name||'') + (st.stopping?'（停止中…）':'');
-  if(st.running){ dot.className='dot run'; badge.className='stage'; badge.textContent=st.stage_name||'运行中';
+  if(st.running){
+    badge.className='stage'; badge.textContent=st.stage_name||'运行中';
     $('btnStart').disabled=true; $('btnStop').disabled=false; $('btnResume').disabled=true;
-    if(st.stopping) $('btnStop').textContent='停止中…'; else $('btnStop').textContent='停止';
+    $('btnStop').textContent = st.stopping?'停止中…':'停止';
   }else{
-    dot.className='dot';
     if(st.stage==='done'){ badge.textContent='✅ 完成'; }
     else if(st.last_error){ badge.className=''; badge.textContent='❌ '+st.last_error.slice(0,20); }
     else if(st.finished){ badge.className=''; badge.textContent=st.stage_name||'已停止'; }
@@ -279,36 +321,13 @@ function applyStatus(st){
     $('btnStop').disabled=true; $('btnStop').textContent='停止';
     $('btnResume').disabled = !st.has_resume;
   }
-  $('statusTxt').textContent = st.running?'后台任务运行中，可安全关闭页面':'空闲';
-  // 实时正文
-  if(st.content_tail !== undefined && st.content_tail){
-    if(S.currentTab==='content') $('contentView').textContent = st.content_tail;
-    $('contentLen').textContent = st.content_tail.length;
-  }
+  setWsState(true);   // 顶栏运行点 + 状态文字与推送同步
   // 确认弹窗：有新的待确认项且当前没有更晚的项在展示
   if(st.confirm && (!activeConfirm || st.confirm.id !== activeConfirm.id)){
     openConfirm(st.confirm);
   } else if(!st.confirm){
     closeConfirm();
   }
-  // 完成后刷新文件
-  if(st.result_file){ refreshFiles(); }
-}
-
-// ── 日志轮询（独立、较高频以便实时）──
-async function pollLogs(){
-  try{
-    const d = await (await api('/api/logs?since='+S.logSeq)).json();
-    if(d.logs && d.logs.length){
-      S.logSeq = d.seq;
-      const pre = $('logView');
-      for(const [,msg] of d.logs) pre.textContent += msg + '\n';
-      pre.scrollTop = pre.scrollHeight;
-      if(S.currentTab!=='log') {} // 后台累积即可
-    } else {
-      S.logSeq = d.seq;
-    }
-  }catch(e){}
 }
 
 // ── 确认弹窗逻辑 ──
@@ -485,7 +504,7 @@ function readForm(){
 function resetViews(){
   $('contentView').textContent='任务已启动，等待生成…';
   $('logView').textContent='';
-  S.logSeq=0;
+  S.lastFile='';
 }
 
 // ── 成品文件列表 ──
@@ -504,9 +523,8 @@ async function refreshFiles(){
 
 // ── 启动 ──
 loadCfg();
-setInterval(poll, 800);
-setInterval(pollLogs, 1000);
-setInterval(refreshFiles, 5000);
+connectWS();
+$('btnRefreshFiles').onclick = ()=>refreshFiles();
 </script>
 </body>
 </html>

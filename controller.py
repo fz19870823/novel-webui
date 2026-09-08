@@ -37,6 +37,10 @@ class JobManager:
         self._log_buf = deque(maxlen=LOG_CAPACITY)
         self._log_seq = 0
 
+        # 变更通知（WebSocket 订阅）：_rev 在状态变更时自增，_cond 唤醒订阅线程
+        self._rev = 0
+        self._cond = threading.Condition()
+
         # 当前任务快照
         self.task = {
             "running": False,
@@ -62,12 +66,20 @@ class JobManager:
     def _now(self) -> float:
         return time.time()
 
+    def _bump(self):
+        """状态/日志/正文/确认项变更后调用：唤醒 /ws 订阅线程。"""
+        with self._lock:
+            self._rev += 1
+        with self._cond:
+            self._cond.notify_all()
+
     def _log(self, message: str):
         """内部日志（带时间戳），入环形缓冲。"""
         line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
         with self._lock:
             self._log_seq += 1
             self._log_buf.append((self._log_seq, line))
+        self._bump()
 
     # ── 引擎回调（在引擎线程内被调用）──
 
@@ -78,11 +90,13 @@ class JobManager:
         with self._lock:
             self.task["progress"] = value
             self.task["progress_text"] = text
+        self._bump()
 
     def cb_content(self, content: str):
         # 引擎的 content_callback 每次传累积后的全文，这里存全文；返回时截尾
         with self._lock:
             self.task["latest_content"] = content
+        self._bump()
 
     def cb_state(self, state: dict):
         save_resume_state(state)
@@ -91,6 +105,7 @@ class JobManager:
             self.task["call_count"] = state.get("call_count", self.task["call_count"])
             self.task["stage"] = state.get("stage", self.task["stage"])
             self.task["stage_name"] = _STAGE_NAMES.get(state.get("stage"), self.task["stage_name"])
+        self._bump()
 
     def cb_confirm(self, title: str, content: str, prompt: str) -> str:
         """引擎线程在此阻塞，直到倒计时结束或前端应答。返回引擎要的结果字符串。"""
@@ -182,10 +197,16 @@ class JobManager:
             items = [(s, m) for s, m in self._log_buf if s > since_seq]
             return {"seq": self._log_seq, "logs": items}
 
+    def get_content_tail(self, length: int = CONTENT_TAIL) -> str:
+        """返回实时正文尾部（WebSocket 订阅用，避免整段拷贝全量）。"""
+        with self._lock:
+            return self.task["latest_content"][-length:]
+
     def get_status(self, since_seq: int = 0, with_content: bool = False) -> dict:
         with self._lock:
             t = self.task
             status = {
+                "rev": self._rev,
                 "running": t["running"],
                 "stopping": t["stopping"],
                 "finished": t["finished"],
@@ -214,10 +235,12 @@ class JobManager:
             if stage:
                 self.task["stage"] = stage
                 self.task["stage_name"] = stage_name or _STAGE_NAMES.get(stage, stage)
+        self._bump()
 
     def set_stopping(self):
         with self._lock:
             self.task["stopping"] = True
+        self._bump()
 
     def mark_done(self, novel_title: str, result_file: str):
         with self._lock:
@@ -233,6 +256,7 @@ class JobManager:
             t["has_resume"] = False
             if result_file:
                 clear_resume_state()
+        self._bump()
 
     def mark_error(self, message: str):
         with self._lock:
@@ -243,6 +267,7 @@ class JobManager:
             t["last_error"] = message
             t["stage_name"] = "出错"
         self._log(f"❌ {message}")
+        self._bump()
 
     def mark_stopped(self):
         """用户手动停止（非错误），保留断点供续传。"""
@@ -254,10 +279,12 @@ class JobManager:
             t["stage_name"] = "已停止（可续传）"
             t["last_error"] = ""
         self._log("🛑 已手动停止，进度已保留可续传")
+        self._bump()
 
     def set_has_resume(self, val: bool):
         with self._lock:
             self.task["has_resume"] = val
+        self._bump()
 
     def reset_before_run(self):
         """新任务/续传开始前的快照清理（不覆盖断点文件本身）。"""
@@ -273,6 +300,7 @@ class JobManager:
             self.task["novel_title"] = ""
             self.task["call_count"] = 0
             self.confirm = None
+        self._bump()
 
 
 _STAGE_NAMES = {

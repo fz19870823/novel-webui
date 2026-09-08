@@ -105,6 +105,41 @@ docker run -d --name novel-webui -p 8000:8000 \
   升级镜像不丢数据。查看成品：`docker compose exec novel-webui ls /data`。
 - 服务健康检查：`docker inspect --format '{{.State.Health.Status}}' novel-webui`。
 
+## 反向代理（WebSocket）
+
+前端实时显示走 **`/ws`** WebSocket（状态/日志/正文/待确认项推送），已移除原来的 GET 轮询。
+页面通过**同源相对地址**连接 ws/wss，因此任何反代只要正确转发 `/ws` 的
+`Upgrade`/`Connection` 头即可，前端无需改地址（https 下自动用 wss）。
+
+```nginx
+# nginx：HTTP 与 WS 走同一 server
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+location /ws {
+    proxy_pass http://127.0.0.1:8000/ws;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;      # ← WS 升级关键
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 3600s;                    # 服务端每 15s 心跳，这里配长即可
+    proxy_send_timeout 3600s;
+}
+```
+
+```caddy
+# Caddy：自动处理 WebSocket Upgrade，无需额外配置
+example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+```
+
+> 云端 CDN（Cloudflare 等）需在面板开启 WebSocket 支持；服务端空闲时会每 15s 发送
+> 心跳帧 `{"type":"ping"}`（浏览器回 `pong`），避免反代/中间层因空闲断连。
+> 直连场景不受心跳影响。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
