@@ -634,7 +634,18 @@ class NovelGenerator:
         self._update_progress(25, "正在分解场景...")
 
         batch_size = 2
-        all_scenes: List[Dict] = []
+        # 断点续传：__init__ 已把断点里保存的场景恢复到 self.scenes。
+        # 批次内每章都已有场景的批次视为已完成，直接跳过，只生成缺失批次，
+        # 避免停止/续传后把整个场景分解从头重跑。
+        all_scenes: List[Dict] = list(self.scenes)
+        restored_covered: set = set()
+        for _sc in all_scenes:
+            try:
+                restored_covered.add(int(_sc.get("chapter")))
+            except (TypeError, ValueError):
+                continue
+        if restored_covered:
+            self._log(f"📂 断点续传：断点已有 {len(all_scenes)} 个场景，跳过已完成批次")
 
         chapter_summaries = []
         for i, outline in enumerate(self.chapter_outlines, 1):
@@ -666,6 +677,12 @@ class NovelGenerator:
             end_index = min(start_index + batch_size, len(chapter_summaries))
             ch_start = start_index + 1
             ch_end = end_index
+            # 该批每章都已有场景（断点中已完成）→ 跳过，避免重复生成
+            if all(c in restored_covered for c in range(ch_start, ch_end + 1)):
+                self._log(f"📂 断点续传：第{ch_start}-{ch_end}章场景已在断点中，跳过本批")
+                continue
+            if not self.is_running:
+                raise Exception("用户停止生成")
             batch_chapters = chapter_summaries[start_index:end_index]
             batch_scenes_estimate = len(batch_chapters) * 5
 
