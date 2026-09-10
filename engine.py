@@ -31,6 +31,8 @@ OUTLINE_BATCH = 15
 CONFIRM_COUNTDOWN = 5
 WRITE_ROUNDS = 3
 RETRY_MAX = 3
+# 场景一致性审查的修订轮次上限：首轮修订后必须做二次校验，未过才再修订一轮
+SCENE_REVISE_MAX = 2
 STREAM_IDLE_TIMEOUT = 10.0
 FIRST_CONTENT_TIMEOUT = 30.0
 
@@ -111,7 +113,9 @@ class NovelGenerator:
                  viewer_check: Callable = None,
                  resume_state: Dict = None,
                  chapters_count: int = None,
-                 words_per_chapter: int = None):
+                 words_per_chapter: int = None,
+                 single_chapter_scene: bool = None,
+                 single_chapter_write: bool = None):
         self.theme = theme
         self.requirements = requirements
         self.api_key = api_key
@@ -138,11 +142,27 @@ class NovelGenerator:
         self.target_words = self.chapters_count * self.words_per_chapter
         self.scenes_per_chapter = max(3, self.words_per_chapter // self.words_per_scene)
 
-        # 自适应批大小
+        # 批粒度开关：分解（layer3 场景）与正文（layer4 写作）分开控制，互不影响。
+        # 三态：None = 未指定 → 回落到断点里记录的值；显式 True/False 优先。
+        # 兼容拆分前的单一开关 single_chapter（当时同时管两处）。
+        _rcfg = (resume_state or {}).get("config", {}) or {}
+        _legacy = _rcfg.get("single_chapter")
+        _legacy = False if _legacy is None else bool(_legacy)
+        if single_chapter_scene is None:
+            single_chapter_scene = _rcfg.get("single_chapter_scene", _legacy)
+        if single_chapter_write is None:
+            single_chapter_write = _rcfg.get("single_chapter_write", _legacy)
+        self.single_chapter_scene = bool(single_chapter_scene)
+        self.single_chapter_write = bool(single_chapter_write)
+
+        # 自适应批大小（正文单章模式下禁用升级，chunk_size 恒为 1）
         self.chunk_size = 1
         self._quality_streak = 0
-        self._adaptive_chunk_enabled = True
+        self._adaptive_chunk_enabled = not self.single_chapter_write
         self.ROUNDS = WRITE_ROUNDS
+
+        # 场景审查的遗留问题说明（二次校验仍未通过时写入，随确认文案一起展示）
+        self._scene_review_notes = ""
 
         self.client = None
         self.call_count = 0
@@ -221,7 +241,9 @@ class NovelGenerator:
                 "requirements": self.requirements,
                 "config": {
                     "base_url": self.base_url,
-                    "model": self.model
+                    "model": self.model,
+                    "single_chapter_scene": self.single_chapter_scene,
+                    "single_chapter_write": self.single_chapter_write
                 },
                 "stage": stage,
                 "layer4_batch": layer4_batch,
@@ -754,7 +776,8 @@ class NovelGenerator:
         self._log("\n🔍 第3层：场景分解...")
         self._update_progress(25, "正在分解场景...")
 
-        batch_size = 2
+        # 单章处理模式：一次只分解一章，避免 2 章/批时一批出错连带整批重试
+        batch_size = 1 if self.single_chapter_scene else 2
         # 断点续传：__init__ 已把断点里保存的场景恢复到 self.scenes。
         # 批次内每章都已有场景的批次视为已完成，直接跳过，只生成缺失批次，
         # 避免停止/续传后把整个场景分解从头重跑。
@@ -773,7 +796,7 @@ class NovelGenerator:
             chapter_summaries.append(f"第{i}章: {outline}")
 
         total_batches = (len(chapter_summaries) + batch_size - 1) // batch_size
-        self._log(f"📋 场景分解改为小批生成：共{len(chapter_summaries)}章，每批{batch_size}章（最多约10个场景），共{total_batches}批")
+        self._log(f"📋 场景分解改为小批生成：共{len(chapter_summaries)}章，每批{batch_size}章（最多约{batch_size * 5}个场景），共{total_batches}批")
 
         def chapters_covered(scenes: List[Dict], start_ch: int, end_ch: int) -> bool:
             covered = set()
@@ -883,10 +906,13 @@ class NovelGenerator:
 
         # ── 一次性确认 ──
         formatted = json.dumps(reviewed_scenes, ensure_ascii=False, indent=2)
+        confirm_note = f"请确认或修改以上{len(reviewed_scenes)}个场景。\n已自动完成冲突审查和修订（含二次校验）。\n5秒后自动确认。"
+        if self._scene_review_notes:
+            confirm_note = f"请确认或修改以上{len(reviewed_scenes)}个场景。\n{self._scene_review_notes}\n5秒后自动确认。"
         confirmed = self._confirm_with_user(
             "确认场景分解（已自动审查修订）",
             formatted,
-            f"请确认或修改以上{len(reviewed_scenes)}个场景。\n已自动完成冲突审查和修订。\n5秒后自动确认。"
+            confirm_note
         )
 
         if confirmed == "__REGENERATE__":
@@ -967,17 +993,37 @@ class NovelGenerator:
 
     # ── 场景冲突审查 ──
 
-    def _review_scene_conflicts(self, scenes: List[Dict]) -> List[Dict]:
+    def _audit_scenes(self, scenes: List[Dict], prev_review: Dict = None) -> Dict:
+        """跑一次场景一致性审查，返回结构化审查结果；失败返回 {}（由调用方决定是否降级）。
+
+        prev_review 非空 = 这是**二次校验**：上一轮指出的问题会一并交给审查方，
+        要求逐条确认是否真的解决，并额外检查修订有没有引入新的逻辑矛盾。
         """
-        v2.0 优化：审查+修订合并在后台完成，直接返回修订后的场景列表。
-        不再弹出确认对话框。
-        """
-        self._log("\n🧪 场景一致性审查：检查重复场景、结尾提前、逻辑冲突...")
+        # 审查属于「场景」阶段：无论从 layer3 还是 layer4 触发，拒答登记都归到 layer3，
+        # 避免被误标成 layer4（那样用户会被引导去"补写正文"，而其实该重跑场景）。
+        self._ctx = {"stage": "layer3", "chapters": list(range(1, len(self.chapter_outlines) + 1))}
+
         chapter_summaries = []
         for i, outline in enumerate(self.chapter_outlines, 1):
             chapter_summaries.append(f"第{i}章: {outline}")
 
         scenes_json = json.dumps(scenes, ensure_ascii=False, indent=2)
+
+        prev_block = ""
+        recheck_rules = ""
+        if prev_review:
+            prev_issues = prev_review.get("revisions", []) or []
+            prev_block = f"""
+【上一轮审查指出的问题（请逐条确认是否已解决）】
+{json.dumps(prev_issues, ensure_ascii=False, indent=2)}
+"""
+            recheck_rules = """
+6. 复核上一轮问题：逐条核对上面列出的问题是否真的解决了（不能只看措辞变化）
+7. 修订副作用：修订是否引入了新的矛盾（如前后文不再衔接、改了此处忘了彼处）
+8. 返回要求：只要还有任一条问题存在，就照常放进 revisions（不要因为有"已修订过"就放宽）；
+   全部解决且无新问题，才返回 has_issues: false
+"""
+
         prompt = f"""
 请审查以下小说场景分解是否存在剧情冲突或结构问题，并返回结构化 JSON。
 
@@ -986,14 +1032,14 @@ class NovelGenerator:
 
 【场景分解 JSON】
 {scenes_json}
-
+{prev_block}
 重点检查：
 1. 重复场景：同一事件是否被多个场景/章节重复写过
 2. 结尾提前：最终决战、最终和解等是否过早出现
 3. 顺序错乱：因果是否倒置
 4. 角色状态冲突：受伤/死亡/离开等是否前后矛盾
 5. 节奏问题：某些章节是否场景过少或高潮提前释放
-
+{recheck_rules}
 只输出合法 JSON 对象，格式：
 {{
   "has_issues": true,
@@ -1022,18 +1068,111 @@ class NovelGenerator:
                 show_stream=True
             )
             review = self._extract_json_object(response)
+        except RefusalSkipped:
+            # 拒答信号必须原样冒泡（layer1-3 无法"留空继续"，由上层中止任务并保留断点）；
+            # 若在此被当成"审查失败"吞掉，流水线会带着未审查的场景继续跑。
+            raise
         except Exception as e:
-            self._log(f"⚠️ 场景一致性审查失败，跳过：{str(e)[:150]}")
+            self._log(f"⚠️ 场景一致性审查调用失败：{str(e)[:150]}")
+            return {}
+
+        if not isinstance(review, dict):
+            self._log("⚠️ 场景一致性审查返回结构不是 JSON 对象")
+            return {}
+        return review
+
+    @staticmethod
+    def _review_has_issues(review: Dict) -> bool:
+        """审查结果是否给出了需要处理的修订项。"""
+        if not isinstance(review, dict):
+            return False
+        return bool(review.get("has_issues")) and bool(review.get("revisions"))
+
+    def _review_scene_conflicts(self, scenes: List[Dict]) -> List[Dict]:
+        """场景一致性审查 → 自动修订 → **二次校验**（修订后重审，确认问题真的解决）。
+
+        闭环：首轮审查 → 修订 → 再跑一遍审查复核。
+        - 复核通过 → 返回修订结果，日志写明"二次校验通过"；
+        - 复核仍有问题 → 用复核结果再修订一轮（上限 SCENE_REVISE_MAX 轮）；
+        - 达上限仍有问题 → 保留最后一次修订结果，把遗留问题写进 `_scene_review_notes`
+          并带入用户确认文案，交由人工把关，而不是"改过一次就当好了"。
+        """
+        self._scene_review_notes = ""
+        self._log("\n🧪 场景一致性审查：检查重复场景、结尾提前、逻辑冲突...")
+
+        review = self._audit_scenes(scenes)
+        if not review:
+            self._log("⚠️ 场景一致性审查未取得有效结果，跳过审查（场景未经校验，请注意确认）")
+            self._scene_review_notes = "⚠️ 本次自动审查未取得有效结果，场景未经过一致性校验。"
             return scenes
 
-        if review.get("has_issues") and review.get("revisions"):
-            self._log(f"🔧 发现冲突，后台自动修订：{len(review.get('revisions', []))}项")
-            revised = self._revise_scene_conflicts(scenes, review)
-            self._log(f"✅ 场景冲突审查完成，已自动修订")
-            return revised
-        else:
+        if not self._review_has_issues(review):
             self._log("✅ 场景冲突审查未发现需要自动修订的问题")
             return scenes
+
+        current = scenes
+        for attempt in range(1, SCENE_REVISE_MAX + 1):
+            count = len(review.get("revisions", []) or [])
+            self._log(f"🔧 第{attempt}轮：发现 {count} 项问题，后台自动修订")
+            revised = self._revise_scene_conflicts(current, review)
+
+            if revised is current or revised == current:
+                self._log("⚠️ 修订未产生实际改动（修订无产出或目标场景未变），停止后续轮次")
+                self._scene_review_notes = self._format_review_notes(review)
+                return current
+
+            # ── 二次校验：把上一轮的问题原样交回去，逐条核对 ──
+            self._log(f"🔍 二次校验：复核第{attempt}轮修订结果...")
+            check = self._audit_scenes(revised, prev_review=review)
+
+            if not check:
+                self._log("⚠️ 二次校验未取得有效结果，采用本轮修订结果（未复核，请注意确认）")
+                self._scene_review_notes = "⚠️ 二次校验未取得有效结果，修订结果未经复核。"
+                return revised
+
+            if not self._review_has_issues(check):
+                self._log(f"✅ 二次校验通过：第{attempt}轮修订后未再发现逻辑问题")
+                return revised
+
+            remain = len(check.get("revisions", []) or [])
+            self._log(f"⚠️ 二次校验仍发现 {remain} 项问题")
+            current, review = revised, check
+
+        self._log(f"⚠️ 已达修订上限（{SCENE_REVISE_MAX}轮），仍有逻辑问题未解决，"
+                  f"保留最后一次修订结果并在确认环节提示人工把关")
+        self._scene_review_notes = self._format_review_notes(review)
+        return current
+
+    @staticmethod
+    def _format_review_notes(review: Dict) -> str:
+        """把仍未解决的问题整理成一段可读提示（带入用户确认文案）。"""
+        if not isinstance(review, dict):
+            return ""
+        summary = (review.get("summary") or "").strip()
+        items = []
+        for r in (review.get("revisions", []) or []):
+            if not isinstance(r, dict):
+                continue
+            problem = (r.get("problem") or "").strip()
+            if not problem:
+                continue
+            targets = []
+            for t in (r.get("targets", []) or []):
+                try:
+                    targets.append(f"第{int(t.get('chapter', 0))}章·场景{int(t.get('scene_id', 0))}")
+                except (TypeError, ValueError):
+                    continue
+            where = f"（{'、'.join(targets)}）" if targets else ""
+            sev = (r.get("severity") or "").strip()
+            items.append(f"- [{sev or '未标注'}]{where} {problem}")
+        if not summary and not items:
+            return ""
+        lines = ["⚠️ 自动修订后仍有以下逻辑问题未解决，请在确认前留意："]
+        if summary:
+            lines.append(f"总体结论：{summary}")
+        lines.extend(items[:20])
+        return "\n".join(lines)
+
 
     def _revise_scene_conflicts(self, scenes: List[Dict], review: Dict) -> List[Dict]:
         """根据结构化审查建议重新生成需要修改的场景（每批最多5个）"""
@@ -1102,6 +1241,9 @@ class NovelGenerator:
                     self._log(f"✅ 第{batch_idx + 1}/{len(batches)}批完成")
                 else:
                     self._log("⚠️ 批次修订返回结构无效，跳过该批")
+            except RefusalSkipped:
+                # 同审查：拒答信号不能被当成"该批修订失败"吞掉
+                raise
             except Exception as e:
                 self._log(f"⚠️ 批次修订失败，跳过：{str(e)[:150]}")
 
@@ -1363,7 +1505,10 @@ class NovelGenerator:
     def layer4_write_scenes(self, start_chapter: int = 1) -> str:
         """第4层：批量写作 + 自适应批大小 + 自适应轮次"""
         self._log(f"\n✍️ 第4层：批量写作（{self.chunk_size}章/批 × {self.ROUNDS}轮迭代）...")
-        self._log(f"   📊 自适应批大小已启用：初始1章/批，连续2章质量达标后自动升级为2章/批")
+        if self.single_chapter_write:
+            self._log("   📊 正文单章模式已开启：始终 1 章/批，不做批量升级")
+        else:
+            self._log(f"   📊 自适应批大小已启用：初始1章/批，连续2章质量达标后自动升级为2章/批")
 
         if not self.scenes:
             self.scenes = self._generate_fallback_scenes()

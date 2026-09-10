@@ -39,7 +39,23 @@ def _default_config() -> dict:
         "requirements": "",
         "chapters_count": "",
         "words_per_chapter": "",
+        # 批粒度开关（分解 / 正文分开控制）：True = 每次只处理一章
+        "single_chapter_scene": False,   # layer3 场景分解：1 章/批（关 = 2 章/批）
+        "single_chapter_write": False,   # layer4 正文写作：1 章/批 且不做批量升级
     }
+
+
+def _migrate_single_chapter(saved: dict) -> dict:
+    """兼容拆分前的单一开关 `single_chapter`（当时同时控制分解与正文）。
+
+    仅当新键缺失时才用旧值补齐，避免覆盖用户已经分别设置过的值。
+    """
+    if not isinstance(saved, dict) or "single_chapter" not in saved:
+        return saved
+    legacy = bool(saved.pop("single_chapter"))
+    saved.setdefault("single_chapter_scene", legacy)
+    saved.setdefault("single_chapter_write", legacy)
+    return saved
 
 
 # ─────────── Fernet 密钥 / 加解密 ───────────
@@ -94,7 +110,7 @@ def load_config() -> dict:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-            config.update(saved)
+            config.update(_migrate_single_chapter(saved))
         except (json.JSONDecodeError, IOError) as e:
             print(f"[WARN] 加载配置失败: {e}")
 
@@ -142,7 +158,8 @@ def save_config(config: dict):
 
     # 仅保留已知字段，避免历史残留噪音
     known = {"api_key", "api_key_enc", "base_url", "model", "theme",
-             "requirements", "chapters_count", "words_per_chapter"}
+             "requirements", "chapters_count", "words_per_chapter",
+             "single_chapter_scene", "single_chapter_write"}
     safe = {k: v for k, v in safe.items() if k in known}
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:

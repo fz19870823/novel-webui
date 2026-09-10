@@ -43,6 +43,11 @@ aside{width:340px;min-width:300px;overflow-y:auto;padding:16px;background:var(--
 .row{display:flex;gap:8px;min-width:0}
 .row .f{flex:1;min-width:0}
 .hint{font-size:11px;color:var(--muted);line-height:1.5;margin-top:2px;overflow-wrap:anywhere;word-break:break-word}
+.chk{display:flex;align-items:flex-start;gap:8px;font-size:12px;color:var(--text);line-height:1.5;cursor:pointer;user-select:none;margin-bottom:12px}
+.chk input{width:16px;height:16px;flex:0 0 auto;margin-top:1px;accent-color:var(--accent);cursor:pointer}
+.chk .sub{display:block;font-size:11px;color:var(--muted);margin-top:2px}
+.chks .chk{flex:1;min-width:0}
+.chks .chk span{min-width:0}
 /* ── Model 自定义下拉(combobox) ── */
 .combobox{position:relative;display:flex;align-items:center}
 .combobox input{width:100%;padding-right:34px;overflow-wrap:normal;text-overflow:ellipsis}
@@ -218,6 +223,16 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
         <div class="f" data-page-node-id="dWsBbZgkliyeaR4uAAdAim"><label data-page-node-id="5vkMrRHTY6cQPaJXVtFkbj">章节数（留空自动）</label><input id="cc" type="number" min="1" placeholder="自动" data-page-node-id="hLmQvTFRJbNjJIXsMBD18T"></div>
         <div class="f" data-page-node-id="XX605rWiSF5cGQhdpmyRvE"><label data-page-node-id="WsOqdCHdgq9Mm9y6EAATuM">每章字数（默认1200）</label><input id="wpc" type="number" min="100" placeholder="1200" data-page-node-id="KXNGQ3zotWDSQ11sBKWCRO"></div>
       </div>
+      <div class="row chks">
+        <label class="chk" for="scScene" title="场景分解每批只做 1 章（关闭 = 2 章/批）">
+          <input type="checkbox" id="scScene">
+          <span>分解单章<span class="sub">场景分解每次只做 1 章</span></span>
+        </label>
+        <label class="chk" for="scWrite" title="正文写作每批只写 1 章，且不做 1→2 的自动升级">
+          <input type="checkbox" id="scWrite">
+          <span>正文单章<span class="sub">正文每次只写 1 章，不自动升级</span></span>
+        </label>
+      </div>
     </div>
 
     <!-- 3. 控制 -->
@@ -320,6 +335,8 @@ async function loadCfg(){
   $('base_url').value = c.base_url;
   $('model').value = c.model;
   $('cc').value = c.chapters_count; $('wpc').value = c.words_per_chapter;
+  $('scScene').checked = !!c.single_chapter_scene;
+  $('scWrite').checked = !!c.single_chapter_write;
   $('theme').value = c.theme; $('req').value = c.requirements;
   $('keyHint').textContent = c.api_key_env ? `🔒 已用环境变量 (${c.api_key_masked})`
     : c.api_key_masked !== '未配置' ? `已配置 (${c.api_key_masked})，可留空` : '⚠ 未配置 Key';
@@ -678,6 +695,8 @@ function readForm(){
     requirements: $('req').value,
     chapters_count: $('cc').value,
     words_per_chapter: $('wpc').value,
+    single_chapter_scene: $('scScene').checked,
+    single_chapter_write: $('scWrite').checked,
   };
 }
 function resetViews(){

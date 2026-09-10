@@ -26,6 +26,7 @@ class GeneratorWorker:
     def __init__(self, theme: str, requirements: str, api_key: str,
                  base_url: str, model: str,
                  chapters_count=None, words_per_chapter=None,
+                 single_chapter_scene=None, single_chapter_write=None,
                  resume: bool = False):
         self.theme = theme
         self.requirements = requirements
@@ -34,6 +35,9 @@ class GeneratorWorker:
         self.model = model
         self.chapters_count = chapters_count
         self.words_per_chapter = words_per_chapter
+        # None = 未指定（续传时回落到断点里记录的粒度）
+        self.single_chapter_scene = single_chapter_scene
+        self.single_chapter_write = single_chapter_write
         self.resume = resume
 
         self._thread = None
@@ -100,6 +104,8 @@ class GeneratorWorker:
                 resume_state=resume_state,
                 chapters_count=self.chapters_count,
                 words_per_chapter=self.words_per_chapter,
+                single_chapter_scene=self.single_chapter_scene,
+                single_chapter_write=self.single_chapter_write,
             )
 
             story = self._generator.run(start_stage=start_stage)

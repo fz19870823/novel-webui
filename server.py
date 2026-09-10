@@ -233,6 +233,15 @@ def ws_handler(ws):
         cli.close()
 
 
+def _as_bool(v) -> bool:
+    """宽松布尔解析：接受 true/false、"1"/"0"、on/off、是/否（前端表单可能发字符串）。"""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "是", "开")
+
+
 def _stage_info():
     """返回启动页需要的默认配置 + 可续传标记（不返回 key）。"""
     cfg = load_config()
@@ -243,6 +252,8 @@ def _stage_info():
         "api_key_env": bool(os.environ.get("NOVEL_AI_API_KEY", "")),
         "chapters_count": cfg.get("chapters_count", ""),
         "words_per_chapter": cfg.get("words_per_chapter", ""),
+        "single_chapter_scene": _as_bool(cfg.get("single_chapter_scene", False)),
+        "single_chapter_write": _as_bool(cfg.get("single_chapter_write", False)),
         "theme": cfg.get("theme", ""),
         "requirements": cfg.get("requirements", ""),
         "has_resume": load_resume_state() is not None,
@@ -404,6 +415,10 @@ def api_config_set():
     for k in ("base_url", "model", "chapters_count", "words_per_chapter", "theme", "requirements"):
         if k in data and data[k] is not None:
             cfg[k] = str(data[k]).strip()
+    # 单章处理开关是布尔值，不能走上面的 str() 强转（否则 False 会存成 "False" 恒真）
+    for bk in ("single_chapter_scene", "single_chapter_write"):
+        if bk in data and data[bk] is not None:
+            cfg[bk] = _as_bool(data[bk])
     # API Key：非空才写入（会持久化到配置文件；有环境变量时文件不存明文，见 save_config 语义）
     new_key = (data.get("api_key") or "").strip()
     if new_key:
@@ -498,12 +513,20 @@ def api_start():
     except ValueError:
         return jsonify({"ok": False, "message": "每章字数必须是整数"})
 
+    # 批粒度开关（分解 / 正文分开控制）：不传 → 沿用已保存的开关
+    sc_scene = _as_bool(data["single_chapter_scene"]) if data.get("single_chapter_scene") is not None \
+        else _as_bool(cfg.get("single_chapter_scene", False))
+    sc_write = _as_bool(data["single_chapter_write"]) if data.get("single_chapter_write") is not None \
+        else _as_bool(cfg.get("single_chapter_write", False))
+
     # 保存界面偏好（不含 key）
     save_config({**cfg, "theme": theme,
                  "requirements": (data.get("requirements") or "").strip(),
                  "base_url": base_url, "model": model,
                  "chapters_count": str(cc) if cc else "",
-                 "words_per_chapter": str(wpc) if wpc else ""})
+                 "words_per_chapter": str(wpc) if wpc else "",
+                 "single_chapter_scene": sc_scene,
+                 "single_chapter_write": sc_write})
 
     with _worker_lock:
         _worker = GeneratorWorker(
@@ -514,6 +537,8 @@ def api_start():
             model=model,
             chapters_count=cc,
             words_per_chapter=wpc,
+            single_chapter_scene=sc_scene,
+            single_chapter_write=sc_write,
         )
         _worker.start()
     return jsonify({"ok": True, "message": "任务已启动（后台运行）"})
@@ -542,6 +567,22 @@ def api_resume():
     if stage == "done":
         stage = "layer1"
 
+    # 单章处理开关：以界面上点续传时的状态为准；界面没带则沿用断点记录的粒度，
+    # 最后才回落全局配置 —— 保证「续传保持原批次粒度，但允许用户显式改」。
+    st_cfg = st.get("config") or {}
+
+    def _pick_flag(key: str) -> bool:
+        if data.get(key) is not None:
+            return _as_bool(data[key])
+        if key in st_cfg:
+            return _as_bool(st_cfg[key])
+        # 兼容拆分前的单一开关（同时管分解与正文）
+        if "single_chapter" in st_cfg:
+            return _as_bool(st_cfg["single_chapter"])
+        return _as_bool(cfg.get(key, False))
+
+    sc_scene, sc_write = _pick_flag("single_chapter_scene"), _pick_flag("single_chapter_write")
+
     with _worker_lock:
         _worker = GeneratorWorker(
             theme=st.get("theme", ""),
@@ -549,6 +590,8 @@ def api_resume():
             api_key=key,
             base_url=base_url,
             model=model,
+            single_chapter_scene=sc_scene,
+            single_chapter_write=sc_write,
             resume=True,
         )
         _worker.start()
