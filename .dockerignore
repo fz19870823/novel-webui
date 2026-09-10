@@ -15,7 +15,14 @@ key.env.example
 .model_secret
 novel_generator_config.json
 novel_resume_state.json
+novel_resume_chapters
+novel_resume_static
 .env
+
+# 登录鉴权凭据 / session 签名密钥 / 首次初始化口令
+auth_users.json
+.session_secret
+.setup_token
 
 # 生成的小说成品 / 日志（含中文文件名，如 超能情人_20260908_172555.txt）
 novel_*.txt

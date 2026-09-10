@@ -10,6 +10,10 @@ services:
     environment:
       # API Key 建议在此注入（或宿主机环境变量），页面里填写的会加密存到 /data
       NOVEL_AI_API_KEY: ${NOVEL_AI_API_KEY:-}
+      # 在反向代理之后部署时置 1：登录限流按 X-Forwarded-For 里的真实客户端 IP 计数
+      NOVEL_TRUST_PROXY: ${NOVEL_TRUST_PROXY:-}
+      # 仅 HTTPS 访问时置 1：给 session cookie 追加 Secure 标记
+      NOVEL_COOKIE_SECURE: ${NOVEL_COOKIE_SECURE:-}
     volumes:
       # 成品小说 / 断点 / 本地配置都持久化在这个卷里，升级镜像不丢数据
       - novel_data:/data

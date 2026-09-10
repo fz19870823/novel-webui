@@ -12,6 +12,7 @@ novel-webui 任务控制中枢
   天然支持断线重连、多标签页。拉取时附带 seq，超过容量即截断丢弃最旧日志。
 """
 
+import re
 import threading
 import time
 from collections import deque
@@ -25,8 +26,11 @@ RESULT_CANCEL = "__CANCEL__"
 RESULT_REGENERATE = "__REGENERATE__"
 
 LOG_CAPACITY = 400          # 环形日志容量
-LOG_RETURN = 120            # 每次轮询最多返回的日志条数
-CONTENT_TAIL = 2000         # /api/content 返回正文尾部字数
+LOG_RETURN = 120            # 每次推送最多返回的日志条数
+CONTENT_TAIL = 2000         # 推送正文时只取尾部这么多字（全文仍在内存中）
+
+# 引擎的 log_callback 已自带 "[HH:MM:SS] " 前缀；若再补一次会出现双时间戳。
+_TS_PREFIX_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\]\s")
 
 
 class JobManager:
@@ -74,8 +78,14 @@ class JobManager:
             self._cond.notify_all()
 
     def _log(self, message: str):
-        """内部日志（带时间戳），入环形缓冲。"""
-        line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+        """内部日志，入环形缓冲。
+
+        引擎的 log_callback 传入的行已带 "[HH:MM:SS] " 前缀（engine._log 自己加的），
+        此处不再重复补时间戳，否则前端会看到 "[09:28:09] [10:00:00] xxx"。
+        """
+        message = "" if message is None else str(message)
+        line = message if _TS_PREFIX_RE.match(message) else \
+            f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
         with self._lock:
             self._log_seq += 1
             self._log_buf.append((self._log_seq, line))
@@ -201,6 +211,16 @@ class JobManager:
         """返回实时正文尾部（WebSocket 订阅用，避免整段拷贝全量）。"""
         with self._lock:
             return self.task["latest_content"][-length:]
+
+    def get_content_len(self) -> int:
+        """返回实时正文的**全文**长度。
+
+        变更检测必须用全文长度：尾部截断后长度封顶在 CONTENT_TAIL，
+        一旦正文超过该上限，用 len(get_content_tail()) 判断「是否变化」
+        会永远判定为无变化 → 前端实时正文在 2000 字后冻结（已修复的 bug）。
+        """
+        with self._lock:
+            return len(self.task["latest_content"])
 
     def get_status(self, since_seq: int = 0, with_content: bool = False) -> dict:
         with self._lock:

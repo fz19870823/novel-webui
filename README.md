@@ -11,8 +11,8 @@
 | 后台运行 | 依赖窗口常开 | **后端常驻，提交任务后关闭页面也能跑完** |
 | 实时流式正文 | 窗口内 | WebSocket 实时推送刷新 |
 | 各层确认 | 模态对话框 | 页面弹窗 + 倒计时自动确认 |
-| 断点续传 | 按钮 | 一键继续上次生成 |
-| 访问控制 | 无 | **内置登录鉴权**（首次启动设置账号） |
+| 断点续传 | 按钮 | 一键继续上次生成（**场景分解阶段也能续传**） |
+| 访问控制 | 无 | **内置登录鉴权**（首次启动设置账号 + 初始化口令） |
 
 ## 快速开始
 
@@ -37,14 +37,27 @@ venv\Scripts\python server.py
 
 服务默认开启**账号密码鉴权**：
 
-1. 首次启动后打开页面，会进入「首次初始化」页 → 设置唯一的**管理员账号密码**
-   （密码只存 hash，不落明文），保存后此步骤**永久关闭**。
-2. 此后每次访问都需登录；会话默认保持 30 天。
-3. 凭据文件 `auth_users.json` 与 session 密钥 `.session_secret` 保存在**运行期数据目录**
-   （见下方 NOVEL_DATA_DIR / Docker `/data` 卷），重启服务或容器后继续生效。
+1. 首次启动时控制台会打印一行**初始化口令（setup token）**，形如：
+
+   ```
+   🔐 初始化口令（setup token）：V1a2b3C4d5E6f7G8h9I0jK
+   ```
+
+   该口令同时持久化在数据目录 `.setup_token`（也可用 `docker compose logs novel-webui | grep 初始化口令` 获取）。
+2. 打开页面会进入「首次初始化」页 → 填入**口令 + 管理员账号密码**
+   （密码只存 hash，不落明文），保存后初始化入口**永久关闭**、口令文件自动删除。
+   > 口令的意义：即使服务直接暴露在公网，陌生访问者也**无法抢先注册管理员**。
+3. 此后每次访问都需登录；会话默认保持 30 天。
+4. 凭据文件 `auth_users.json`、session 密钥 `.session_secret`、初始化口令 `.setup_token`
+   都保存在**运行期数据目录**（见下方 `NOVEL_DATA_DIR` / Docker `/data` 卷），重启服务或容器后继续生效。
+
+登录失败限流：同一来源 IP 在 5 分钟内连续失败 5 次即锁定 5 分钟（返回 429）。
+若服务在反向代理之后，需设置 `NOVEL_TRUST_PROXY=1` 才会按 `X-Forwarded-For` 里的**真实客户端 IP** 计数，
+否则所有请求都算在代理 IP 上（默认关闭——直连暴露时 XFF 可伪造，贸然信任等于免限流）。
 
 忘记密码：删除数据目录里的 `auth_users.json` 后重启服务，可重新走首次初始化
-（Docker：`docker compose exec novel-webui rm /data/auth_users.json && docker compose restart novel-webui`）。
+（Docker：`docker compose exec novel-webui rm /data/auth_users.json && docker compose restart novel-webui`；
+重启后会生成**新的初始化口令**）。
 
 ### 一键启动
 
@@ -53,7 +66,7 @@ Windows 双击 **`start.bat`** 即可：
 - 默认绑定 `0.0.0.0:8000`（局域网/远程设备可访问），并自动打开本机浏览器
 - 可选参数：`start.bat [host] [port] [confirm秒]`
 - API Key 自动读取：优先系统环境变量 `NOVEL_AI_API_KEY`，否则读 `key.env`（复制 `key.env.example` 填入即可）
-- 服务运行时保持窗口打开，关闭窗口即停止
+- 服务运行时保持窗口打开，关闭窗口即停止（初始化口令就在这个窗口里）
 
 ### 远程访问
 
@@ -65,29 +78,41 @@ venv\Scripts\python server.py --host 0.0.0.0 --port 8000
 venv\Scripts\python server.py --confirm 10
 ```
 
-> 服务内置登录鉴权（首次启动设置管理员账号）。仍建议：
+> 服务内置登录鉴权（首次启动需初始化口令 + 设置管理员账号）。仍建议：
 > ① 用强密码；② 公网部署叠加反代 TLS；③ 不要把 `auth_users.json` /
-> `.session_secret` 提交到任何代码仓库或镜像层。
+> `.session_secret` / `.setup_token` 提交到任何代码仓库或镜像层。
 
 ## 项目结构
 
 ```
 novel-webui/
-├── server.py          ← Flask 服务 + 全部 API + 登录鉴权守卫
-├── auth.py            ← 首次初始化 / 账号校验 / session 密钥持久化
-├── controller.py      ← 线程安全任务中枢 / 待确认项 / 日志环形缓冲
+├── server.py          ← Flask 服务 + 全部 API + 登录鉴权守卫 + /ws 推送
+├── auth.py            ← 首次初始化口令 / 账号校验 / 登录限流 / session 密钥持久化
+├── controller.py      ← 线程安全任务中枢 / 待确认项 / 日志环形缓冲 / 变更通知
 ├── worker.py          ← 后台生成线程（驱动 NovelGenerator）
 ├── engine.py          ← 生成引擎（复制自 novel-ai）
 ├── config.py          ← 配置管理（复制，Key 不落盘）
-├── state.py           ← 断点管理（复制）
-├── static/index.html  ← 单页前端
+├── state.py           ← 断点管理（进度文件 + 章节/静态分片，见下）
+├── static/index.html  ← 单页前端（WebSocket 推送）
 ├── static/login.html  ← 登录页
-├── static/setup.html  ← 首次初始化页
+├── static/setup.html  ← 首次初始化页（需初始化口令）
 ├── start.bat          ← 一键启动（Windows，自动开浏览器）
 ├── key.env.example    ← API Key 明文文件模板（可选，start.bat 会读取）
 ├── .gitignore
 ├── requirements.txt
 └── README.md
+```
+
+运行期数据目录（`NOVEL_DATA_DIR`，默认=代码目录；容器内 `/data`）内会生成：
+
+```
+novel_generator_config.json     配置（API Key 为 Fernet 密文，环境变量注入时文件留空）
+.model_secret                   Fernet 密钥
+auth_users.json / .session_secret / .setup_token   鉴权凭据与密钥
+novel_resume_state.json         断点进度（小文件，每次保存都写）
+novel_resume_static/<hash>.json 断点静态部分（大纲/场景/设定圣经，内容不变则复用）
+novel_resume_chapters/<hash>.json 断点章节正文分片（内容寻址）
+<标题>_YYYYMMDD_HHMMSS.txt      生成的小说成品
 ```
 
 ## 设计要点
@@ -100,6 +125,14 @@ novel-webui/
 - **同一时刻仅一个任务**：/api/start 有并发锁，防重复提交。
 - **内置鉴权**：除首次初始化/登录页与对应 4 个 API 外，所有页面、`/api/*`、`/ws`
   均需登录（session cookie）；凭据与签名密钥落在数据目录，重启不丢。
+  session cookie 为 `SameSite=Lax + HttpOnly`（HTTPS 部署可加 `NOVEL_COOKIE_SECURE=1`）；
+  `/ws` 握手还会校验 `Origin` 同源（防跨站 WebSocket 劫持）。
+- **断点分片存储**：layer4 每写完一章都会保存断点。旧实现把全部章节正文 + 场景 + 设定
+  塞进单个 JSON 全量重写，写盘量随进度呈 O(N²)（实测 60 章累计 12.4MB）；现改为
+  「小进度文件 + 内容寻址的章节/静态分片」，只写变化的部分，同样场景实测 **0.38MB（33×）**，
+  且元信息为原子写（临时文件 + rename），崩溃不会留下半截 JSON。
+- **实时推送节流**：引擎每个流式 chunk 都会触发变更通知，服务端按最小帧间隔（100ms）合并，
+  最多 10 帧/秒，避免逐 token 全量推送；空闲每 15s 发心跳保活。
 
 ## Docker 部署
 
@@ -119,7 +152,8 @@ docker run -d --name novel-webui -p 8000:8000 \
   ghcr.io/fz19870823/novel-webui:latest
 ```
 
-- 浏览器打开 `http://主机IP:8000`，**首次访问先完成管理员账号初始化**，之后需登录。
+- 浏览器打开 `http://主机IP:8000`，**首次访问先用初始化口令创建管理员账号**，之后需登录。
+  口令获取：`docker compose logs novel-webui | grep 初始化口令`。
 - API Key 建议用 `NOVEL_AI_API_KEY` 环境变量注入；页面填写则 Fernet 加密落盘到数据卷。
 - 生成的小说、断点、本地配置、**登录凭据**全部持久化在 `/data`（compose 卷 `novel_data`），
   升级镜像不丢数据。查看成品：`docker compose exec novel-webui ls /data`。
@@ -139,6 +173,7 @@ location / {
     proxy_pass http://127.0.0.1:8000;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 location /ws {
     proxy_pass http://127.0.0.1:8000/ws;
@@ -158,9 +193,12 @@ example.com {
 }
 ```
 
-> 云端 CDN（Cloudflare 等）需在面板开启 WebSocket 支持；服务端空闲时会每 15s 发送
-> 心跳帧 `{"type":"ping"}`（浏览器回 `pong`），避免反代/中间层因空闲断连。
-> 直连场景不受心跳影响。
+> - 云端 CDN（Cloudflare 等）需在面板开启 WebSocket 支持；服务端空闲时会每 15s 发送
+>   心跳帧 `{"type":"ping"}`（浏览器回 `pong`），避免反代/中间层因空闲断连。
+> - 反代下若要按真实客户端 IP 做登录限流，给容器/进程加 `NOVEL_TRUST_PROXY=1`
+>   （仅在反代会**覆盖**而非透传 `X-Forwarded-For` 时才安全）。
+> - `/ws` 会校验 `Origin` 与请求 Host 的**主机名**一致（忽略端口与协议，
+>   以便 TLS 终结与端口映射场景正常工作）。
 
 ## API 一览
 
@@ -169,8 +207,8 @@ example.com {
 | GET  | `/` | 前端页面（未初始化→首次设置页，未登录→登录页） |
 | GET  | `/setup.html` · `/login.html` | 首次初始化页 · 登录页（公开） |
 | GET  | `/api/auth_state` | 鉴权状态 `{setup_required, authed}`（公开） |
-| POST | `/api/setup` | 首次初始化（仅可调用一次） |
-| POST | `/api/login` · `/api/logout` | 登录 · 退出 |
+| POST | `/api/setup` | 首次初始化（需初始化口令，仅可调用一次） |
+| POST | `/api/login` · `/api/logout` | 登录 · 退出（失败超限返回 429） |
 | GET  | `/api/config` | 读取配置(不含 Key) |
 | POST | `/api/config` | 保存配置 |
 | POST | `/api/test` | 测试连接 |
@@ -179,9 +217,23 @@ example.com {
 | POST | `/api/resume` | 断点续传 |
 | POST | `/api/stop` | 请求停止 |
 | POST | `/api/confirm` | 应答待确认项 |
-| GET  | `/api/status?content=1` | 状态+确认项+正文尾部 |
-| GET  | `/api/logs?since=N` | 增量日志 |
+| GET  | `/api/status?content=1` | 状态+确认项+正文尾部（兼容保留，前端已走 /ws） |
+| GET  | `/api/logs?since=N` | 增量日志（兼容保留，前端已走 /ws） |
 | GET  | `/api/files` | 成品列表 |
 | GET  | `/api/download/xxx.txt` | 下载成品 |
 
 > 除标记「公开」的路径外，其余全部需要登录（session cookie）；`/ws` 未登录在握手阶段即拒绝。
+
+## WebSocket 推送协议
+
+前端与 `/ws` 之间的帧（JSON）：
+
+| 方向 | 帧 | 说明 |
+|---|---|---|
+| 服务端→客户端 | `{"type":"init", status, logs, content, clen}` | 连接建立即推送全量快照 |
+| 服务端→客户端 | `{"type":"diff", status?, logs?, seq?, content?, clen?}` | 增量：只含变化的字段 |
+| 服务端→客户端 | `{"type":"ping"}` | 空闲 15s 心跳，防反代断连 |
+| 客户端→服务端 | `{"type":"pong"}` / `{"type":"ping"}` | 应答心跳 / 探测存活（回 `pong`） |
+
+`content` 是实时正文的**尾部 2000 字**（避免整段重传），`clen` 是**全文长度**——
+字数显示请用 `clen`，用 `content.length` 会封顶在 2000。

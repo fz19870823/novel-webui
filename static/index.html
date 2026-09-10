@@ -280,7 +280,7 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 // ── 常量与状态 ──
 let S = { running:false, stopping:false, wsUp:false, confirmTimer:null,
           confirmSeen:null, cfgLoaded:false, currentTab:'content', cfg:null, models:[],
-          modelIdx:-1, lastFile:'' };
+          modelIdx:-1, lastFile:'', lastContent:'' };
 const $ = id => document.getElementById(id);
 const api = (path, opts) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts))
   .then(r=>{
@@ -360,12 +360,15 @@ function handlePush(d){
   if(d.status && d.status.result_file && d.status.result_file !== S.lastFile){
     S.lastFile = d.status.result_file; refreshFiles();
   }
-  if(typeof d.content === 'string') applyContent(d.content);
+  if(typeof d.content === 'string') applyContent(d.content, d.clen);
 }
-function applyContent(tail){
+function applyContent(tail, clen){
   if(!tail) return;   // 空内容（如新任务刚启动）由占位提示接管
+  S.lastContent = tail;   // 缓存，切回「实时正文」tab 时立即重绘
   if(S.currentTab === 'content') $('contentView').textContent = tail;
-  $('contentLen').textContent = tail.length;
+  // 字数用服务端下发的全文长度：推送的正文只是尾部 2000 字，
+  // 用 tail.length 会封顶在 2000（正文一长就显示不准）。
+  $('contentLen').textContent = (typeof clen === 'number' ? clen : tail.length);
 }
 function appendLogs(logs){
   const pre = $('logView');
@@ -444,7 +447,10 @@ document.querySelectorAll('.tab').forEach(t=>{
     t.classList.add('active');
     S.currentTab = t.dataset.v;
     $('pane-'+S.currentTab).classList.add('active');
-    if(S.currentTab==='content'){ /* 若停在中途，仍显示最后正文 */ }
+    // 切回实时正文：用缓存的最后一帧立即重绘（否则停在旧内容/占位提示）
+    if(S.currentTab==='content' && S.lastContent){
+      $('contentView').textContent = S.lastContent;
+    }
   };
 });
 
@@ -579,7 +585,7 @@ function readForm(){
 function resetViews(){
   $('contentView').textContent='任务已启动，等待生成…';
   $('logView').textContent='';
-  S.lastFile='';
+  S.lastFile=''; S.lastContent='';
 }
 
 // ── 成品文件列表 ──

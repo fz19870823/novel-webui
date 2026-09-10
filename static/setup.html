@@ -46,10 +46,14 @@ button:disabled{opacity:.55;cursor:not-allowed}
   <h1>novel-<span>webui</span></h1>
   <div class="sub">首次启动 · 创建管理员账号</div>
   <div class="warn">本服务已开启登录鉴权。请设置唯一的<strong>管理员账号</strong>，
-    保存后不可重复设置，之后每次访问都需登录。</div>
+    保存后不可重复设置，之后每次访问都需登录。<br>
+    需要<strong>初始化口令</strong>：见服务启动日志中的「🔐 初始化口令」一行，
+    或数据目录下的 <code>.setup_token</code> 文件（创建管理员后自动失效）。</div>
   <form id="f">
+    <div class="f"><label for="tk">初始化口令（setup token）</label>
+      <input id="tk" name="token" autocomplete="off" spellcheck="false" required autofocus></div>
     <div class="f"><label for="u">账号（2-32 个字符，不含空格）</label>
-      <input id="u" name="username" autocomplete="username" required autofocus></div>
+      <input id="u" name="username" autocomplete="username" required></div>
     <div class="f"><label for="p">密码（至少 6 位）</label>
       <input id="p" name="password" type="password" autocomplete="new-password" required></div>
     <div class="f"><label for="p2">确认密码</label>
@@ -71,7 +75,9 @@ button:disabled{opacity:.55;cursor:not-allowed}
   }
   $('f').addEventListener('submit', async ev=>{
     ev.preventDefault();
+    const tk = $('tk').value.trim();
     const u = $('u').value.trim(), p = $('p').value, p2 = $('p2').value;
+    if(!tk){ return fail('请填写初始化口令（见服务启动日志）'); }
     if(u.length < 2){ return fail('账号至少 2 个字符'); }
     if(/\s/.test(u)){ return fail('账号不能含空格'); }
     if(p.length < 6){ return fail('密码至少 6 位'); }
@@ -80,7 +86,7 @@ button:disabled{opacity:.55;cursor:not-allowed}
     try{
       const r = await fetch('/api/setup', {method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({username:u, password:p, confirm:p2})});
+        body:JSON.stringify({token:tk, username:u, password:p, confirm:p2})});
       const d = await r.json();
       if(r.ok && d.ok){ location.replace('/login.html?created=1'); return; }
       fail(d.message || '创建失败');
