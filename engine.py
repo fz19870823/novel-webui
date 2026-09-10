@@ -81,6 +81,21 @@ def _looks_like_refusal(text: str) -> bool:
     return stripped.startswith(("抱歉", "对不起", "sorry", "I'm sorry", "I am sorry"))
 
 
+# 与 controller.py 保持一致的特殊结果字符串
+RESULT_CANCEL = "__CANCEL__"          # 用户取消（中止任务）
+RESULT_REGENERATE = "__REGENERATE__"  # 用户要求原样重发
+RESULT_SKIP = "__SKIP__"              # 用户主动跳过：该部分留空，不登记待处理
+RESULT_TIMEOUT_SKIP = "__SKIP_TO__"   # 倒计时超时自动跳过：留空 + 登记待处理
+
+
+class RefusalSkipped(Exception):
+    """模型拒答后本次调用无产出（用户跳过、超时跳过、或后台运行登记待处理）。
+
+    layer4 写作阶段捕获后对应章节保留空白（不重试、不填充）；layer1-3 前置阶段
+    无法留空继续，向上冒泡使任务中止（断点与拒答记录均已保存）。
+    """
+
+
 # ==============================
 #  NovelGenerator 核心引擎
 # ==============================
@@ -92,6 +107,8 @@ class NovelGenerator:
                  confirm_callback: Callable = None,
                  state_callback: Callable = None,
                  content_callback: Callable = None,
+                 refusal_callback: Callable = None,
+                 viewer_check: Callable = None,
                  resume_state: Dict = None,
                  chapters_count: int = None,
                  words_per_chapter: int = None):
@@ -106,6 +123,13 @@ class NovelGenerator:
         self.confirm_callback = confirm_callback
         self.state_callback = state_callback
         self.content_callback = content_callback
+        # 拒答登记回调（无前端在线时把"被拒的部分"存进待处理列表）
+        self.refusal_callback = refusal_callback
+        # 前端在线检测：True 才弹交互窗；False = 纯后台运行，登记待处理即可
+        self.viewer_check = viewer_check
+
+        # 当前调用上下文（供拒答时标注"哪个阶段/哪几章"）
+        self._ctx: Dict = {"stage": "", "chapters": []}
 
         # 字数 = 章节数 × 每章字数（直接计算，不解析 requirements 文本）
         self.words_per_chapter = words_per_chapter or DEFAULT_WORDS_PER_CHAPTER
@@ -151,6 +175,12 @@ class NovelGenerator:
                 self.words_per_scene = resume_state.get("words_per_scene", DEFAULT_WORDS_PER_SCENE)
                 self.target_words = resume_state.get("target_words", self.target_words)
             self.novel_title = resume_state.get("novel_title", "")
+            # 续传起点取第一个空章：拒答跳过/失败留空的章可在续传时补写，
+            # 而不是从最后完成批次之后开始、把空章永久遗留。
+            first_empty = next((c for c in range(1, self.chapters_count + 1)
+                                if not self.chapters.get(c)), None)
+            if first_empty:
+                self._resume_chapter = first_empty
             self._log(f"📂 从断点恢复 (已写{sum(len(v) for v in self.chapters.values())}个场景, {self.call_count}次调用)")
 
         self._init_client()
@@ -364,11 +394,32 @@ class NovelGenerator:
                     if attempt < RETRY_MAX - 1:
                         time.sleep(2 ** attempt)
                         continue
-                    raise Exception("API连续多次返回拒答内容")
+
+                    # ── 自动重试 3 次仍拒答：分「有前端在线」与「纯后台运行」两条路 ──
+                    if self.confirm_callback and self._viewer_online():
+                        # 有人在看 → 直接推给前端：用户可查看拒答原文、修改发送内容后重发
+                        decision, need_record = self._refusal_interact(prompt, content)
+                        if decision is None:
+                            if need_record:
+                                self._record_refusal(prompt, content)
+                            raise RefusalSkipped()
+                        if decision != prompt:
+                            self._log("✏️ 使用用户修改后的发送内容重新提交（重试次数已重置）")
+                        return self.call_grok(decision, max_tokens=max_tokens,
+                                              temperature=temperature, show_stream=show_stream)
+
+                    # 无前端在线（后台运行）→ 不打扰用户：登记待处理（持久化），该部分留空
+                    self._log("📴 当前无前端在线，登记拒答待处理项，本次调用留空")
+                    self._record_refusal(prompt, content)
+                    raise RefusalSkipped()
 
                 self._log(f"📊 累计调用: {self.call_count} 次 (流式 {len(content)} 字)")
                 return content
 
+            except RefusalSkipped:
+                # 拒答留空信号必须原样冒泡：绝不能被下面的通用重试逻辑当成
+                # "调用失败" 再拿同样的内容去撞一次拒答。
+                raise
             except Exception as e:
                 if not self.is_running:
                     raise Exception("用户停止生成")
@@ -411,6 +462,73 @@ class NovelGenerator:
 
     # ── 用户确认 ──
 
+    def _viewer_online(self) -> bool:
+        """是否有前端在线。
+
+        没接 viewer_check 时退化为"有 confirm_callback 就当有人看"（兼容独立使用）。
+        """
+        if not self.viewer_check:
+            return bool(self.confirm_callback)
+        try:
+            return bool(self.viewer_check())
+        except Exception:
+            return False
+
+    _STAGE_CN = {"layer1": "设定圣经", "layer2": "章节大纲", "layer3": "场景分解",
+                 "layer4": "正文写作", "title": "小说名"}
+
+    def _refusal_label(self) -> str:
+        """拒答项的展示名：「正文写作 · 第3-4章」"""
+        stage = self._ctx.get("stage") or ""
+        base = self._STAGE_CN.get(stage, stage or "未知阶段")
+        chs = self._ctx.get("chapters") or []
+        if not chs:
+            return base
+        if len(chs) == 1:
+            return f"{base} · 第{chs[0]}章"
+        return f"{base} · 第{chs[0]}-{chs[-1]}章"
+
+    def _record_refusal(self, prompt: str, refusal_text: str):
+        """无前端在线：把被拒的部分登记进待处理列表（持久化），等用户上线后逐项处理。"""
+        if not self.refusal_callback:
+            return
+        try:
+            self.refusal_callback(self._ctx.get("stage", ""), self._refusal_label(),
+                                  list(self._ctx.get("chapters") or []), prompt, refusal_text)
+        except Exception as e:
+            self._log(f"⚠️ 登记拒答待处理项失败: {e}")
+
+    def _refusal_interact(self, prompt: str, refusal_text: str):
+        """有前端在线：弹确认窗让用户查看拒答原文、修改发送内容后重发。
+
+        返回 (decision, record)：
+        - (修改后的 prompt, False) —— 用户编辑后重新提交，或原样重发
+        - (None, False)  —— 用户主动跳过（留空，不登记）
+        - (None, True)   —— 倒计时超时跳过（留空，登记待处理）
+        用户点「取消」→ 直接抛异常中止任务。
+        """
+        self._log("🚫 模型连续拒答，推送到前端等待用户处理…")
+        result = self.confirm_callback(
+            "模型拒答：请查看并修改发送内容后重新提交",
+            prompt,
+            "模型自动重试 3 次仍拒答。下方为本次实际发送的内容，可修改（例如弱化敏感表述）后重新提交；"
+            "「原样重发」不改内容直接重试；「跳过」则本次调用无产出（写作阶段对应章节保留空白）。\n"
+            "──────── 模型拒答原文 ────────\n" + (refusal_text or "（空）"),
+            kind="refusal",
+        )
+        if result == RESULT_CANCEL:
+            self.is_running = False
+            raise Exception("用户取消生成")
+        if result == RESULT_SKIP:
+            self._log("⏭️ 用户选择跳过，该部分保留空白")
+            return None, False
+        if result == RESULT_TIMEOUT_SKIP:
+            self._log("⏰ 等待超时，该部分保留空白并登记为待处理")
+            return None, True
+        if result == RESULT_REGENERATE:
+            return prompt, False
+        return (result or prompt), False
+
     def _confirm_with_user(self, title: str, content: str, prompt: str = "") -> str:
         """弹出确认窗口，让用户确认或修改内容"""
         if not self.confirm_callback:
@@ -437,6 +555,7 @@ class NovelGenerator:
     def layer1_setting_bible(self) -> str:
         self._log("\n🏗️ 第1层：生成设定圣经...")
         self._update_progress(5, "正在生成设定圣经...")
+        self._ctx = {"stage": "layer1", "chapters": []}
 
         prompt = f"""
         你是一位专业小说架构师。请根据以下用户输入，生成完整的创作圣经。
@@ -497,6 +616,7 @@ class NovelGenerator:
     def _generate_title(self):
         """根据设定圣经让 AI 生成小说名"""
         self._log("📖 正在生成小说名...")
+        self._ctx = {"stage": "title", "chapters": []}
         prompt = f"""根据以下小说设定，为这部小说取一个吸引人的中文书名。
 
 要求：
@@ -538,6 +658,7 @@ class NovelGenerator:
             if not self.is_running:
                 raise Exception("用户停止生成")
             batch_end = min(batch_start + OUTLINE_BATCH - 1, self.chapters_count)
+            self._ctx = {"stage": "layer2", "chapters": list(range(batch_start, batch_end + 1))}
             prev = "\n\n".join(all_outlines[-3:]) if all_outlines else ""
             batch_outlines = self._generate_outlines_batch(batch_start, batch_end, prev)
             all_outlines.extend(batch_outlines)
@@ -685,6 +806,7 @@ class NovelGenerator:
                 raise Exception("用户停止生成")
             batch_chapters = chapter_summaries[start_index:end_index]
             batch_scenes_estimate = len(batch_chapters) * 5
+            self._ctx = {"stage": "layer3", "chapters": list(range(ch_start, ch_end + 1))}
 
             prompt = f"""
 将第{ch_start}章到第{ch_end}章拆解成具体的写作场景。本批最多约10个场景，请保证每个场景质量，场景描述要足够详细，为后续写作提供充分素材。
@@ -1121,6 +1243,7 @@ class NovelGenerator:
         """批量写作一个章节批次，支持自适应轮次跳过"""
         num_chapters = ch_end - ch_start + 1
         total_target = self.words_per_chapter * num_chapters
+        self._ctx = {"stage": "layer4", "chapters": list(range(ch_start, ch_end + 1))}
 
         # 组装这批章的安排
         chunk_scenes = ""
@@ -1283,11 +1406,15 @@ class NovelGenerator:
                 prev = full_prev[-1000:] if len(full_prev) > 1000 else full_prev
 
             chunk_ok = False
+            refusal_skipped = False
             written_upto = ch_start - 1
             for retry in range(RETRY_MAX):
                 try:
                     written_upto = self._write_chapter_chunk(ch_start, ch_end, chapter_scenes, prev)
                     chunk_ok = True
+                    break
+                except RefusalSkipped:
+                    refusal_skipped = True
                     break
                 except Exception as e:
                     if "用户停止生成" in str(e):
@@ -1303,6 +1430,17 @@ class NovelGenerator:
                         wait = 10 * (retry + 1)
                         self._log(f"⏳ {wait}秒后重试...")
                         time.sleep(wait)
+
+            # 拒答留空（用户跳过 / 超时跳过 / 后台登记待处理）：不重试、不填充，
+            # 本批章节保持空白直接推进；有空章时任务不会被标记完成。
+            if refusal_skipped:
+                self._log(f"⏭️ 第{ch_start}-{ch_end}章因拒答跳过，保留空白（可续传或在「拒答待处理」中补写）")
+                for c in range(ch_start, ch_end + 1):
+                    self.chapters.setdefault(c, [])
+                self._save_state("layer4", ch_end)
+                ch_start = ch_end + 1
+                time.sleep(0.3)
+                continue
 
             # 本批最终仍失败：回退批大小为1，且不让外层死循环卡在坏章上
             if not chunk_ok:
@@ -1341,23 +1479,76 @@ class NovelGenerator:
             ch_start = ch_end + 1
             time.sleep(0.3)
 
-        missing = [c for c in range(1, self.chapters_count + 1) if not self.chapters.get(c)]
+        missing = self.missing_chapters()
         if missing:
-            self._log(f"⚠️ 以下章节缺失: {missing}")
+            self._log(f"⚠️ 以下章节未生成（留空）: {missing}")
 
         return self._merge_to_novel()
 
+    def missing_chapters(self) -> List[int]:
+        """返回 1..chapters_count 中未生成（空白）的章号列表。"""
+        return [c for c in range(1, self.chapters_count + 1) if not self.chapters.get(c)]
+
+    # ── 拒答待处理项的「重新提交」补写 ──
+
+    def fill_chapters_from_prompt(self, prompt: str, chapters: List[int]) -> Dict[int, str]:
+        """用用户确认过的发送内容补写指定章节（层4 拒答项的重新提交路径）。
+
+        与正常写作流程的区别：prompt 是用户在前端看到并（可能）修改过的原文，
+        不再重新拼装；产出按 @@第N章@@ 解析，只接受目标章，写回 chapters 并保存断点。
+        返回实际写成功的 {章号: 正文}（空字典表示仍无产出）。
+        """
+        chapters = sorted({int(c) for c in (chapters or [])})
+        if not chapters:
+            return {}
+        ch_start, ch_end = chapters[0], chapters[-1]
+        self._ctx = {"stage": "layer4", "chapters": chapters}
+        self._log(f"🔁 补写第{ch_start}-{ch_end}章（使用前端确认的发送内容）…")
+        resp = self.call_grok(
+            prompt,
+            max_tokens=self._calculate_max_tokens(self.words_per_chapter * len(chapters), 1, self.ROUNDS),
+            temperature=self._get_dynamic_temperature(1, self.ROUNDS),
+            show_stream=True,
+        )
+        parsed = self._parse_chapters_from_text(resp or "", ch_start, ch_end)
+        parsed = {c: t for c, t in parsed.items() if c in chapters and t and t.strip()}
+        for c in chapters:
+            if c in parsed:
+                self.chapters[c] = [parsed[c]]
+                self._log(f"✅ 第{c}章补写完成 ({len(parsed[c])}字)")
+                self._save_state("layer4", c)
+            else:
+                self.chapters.setdefault(c, [])
+        if not parsed:
+            self._log("⚠️ 补写未产出可用正文，该部分仍留空")
+        return parsed
+
+    def fill_bible_from_prompt(self, prompt: str) -> str:
+        """用用户确认过的发送内容重生成设定圣经（层1 拒答项的重新提交路径）。"""
+        self._ctx = {"stage": "layer1", "chapters": []}
+        self._log("🔁 重新生成设定圣经（使用前端确认的发送内容）…")
+        bible = self.call_grok(prompt, max_tokens=12000, show_stream=True)
+        if not (bible or "").strip():
+            self._log("⚠️ 设定圣经补写为空")
+            return ""
+        self.setting_bible = bible
+        self._save_state("layer2")
+        self._log(f"✅ 设定圣经已更新 ({len(bible)}字)")
+        return bible
+
     def _merge_to_novel(self) -> str:
+        """合并成品。未生成的章节保留章节标题 + 空正文（"空着"），
+        而不是静默丢弃 —— 缺章位置在成品里必须可见，且缺章不允许标记完成。"""
         full_story = []
         for ch_num in range(1, self.chapters_count + 1):
-            if self.chapters.get(ch_num) and self.chapters[ch_num]:
-                chapter_text = self.chapters[ch_num][0]
-                title = ""
-                if ch_num <= len(self.chapter_outlines):
-                    title_match = re.search(r'《([^》]+)》', self.chapter_outlines[ch_num-1])
-                    if title_match:
-                        title = f"《{title_match.group(1)}》"
-                full_story.append(f"\n## 第{ch_num}章{title}\n\n{chapter_text}")
+            title = ""
+            if ch_num <= len(self.chapter_outlines):
+                title_match = re.search(r'《([^》]+)》', self.chapter_outlines[ch_num-1])
+                if title_match:
+                    title = f"《{title_match.group(1)}》"
+            texts = self.chapters.get(ch_num) or []
+            chapter_text = texts[0] if texts else ""
+            full_story.append(f"\n## 第{ch_num}章{title}\n\n{chapter_text}".rstrip())
         return "\n\n".join(full_story)
 
     # ═══════════════════════════════

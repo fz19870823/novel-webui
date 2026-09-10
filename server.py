@@ -37,7 +37,7 @@ from auth import (has_users as auth_has_users,
                   record_login_success as auth_record_ok)
 from state import load_resume_state
 from controller import manager, LOG_RETURN
-from worker import GeneratorWorker
+from worker import GeneratorWorker, RefusalResolver
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -91,9 +91,15 @@ class WsClient:
         self.seq = 0       # 已推日志 seq
         self.clen = -1     # 已推正文「全文」长度（-1 = 尚未推）
         self.alive = True
+        # 在线计数只减一次：发送线程与 handler 线程都会走到 close()
+        self.registered = True
+        manager.register_ws()
 
     def close(self):
         self.alive = False
+        if self.registered:
+            self.registered = False
+            manager.unregister_ws()
         with manager._cond:
             manager._cond.notify_all()
 
@@ -568,6 +574,58 @@ def api_confirm():
     if not ok:
         return jsonify({"ok": False, "message": "没有待确认项或已超时/已应答"})
     return jsonify({"ok": True, "message": "已提交"})
+
+
+# ═══════════ API: 拒答待处理 ═══════════
+# 纯后台运行（无前端在线）时，被模型拒答的部分会登记在这里：
+# 该部分留空 + 记录「实际发送内容」与「拒答原文」，用户上线后逐项处理。
+
+@app.route("/api/refusals")
+def api_refusals():
+    """拒答待处理列表（含发送内容/拒答原文全文，按需拉取避免状态帧过大）。"""
+    return jsonify({"items": manager.get_refusal_items()})
+
+
+@app.route("/api/refusal/resolve", methods=["POST"])
+def api_refusal_resolve():
+    """处理一条拒答项：resubmit=用（可修改的）发送内容重新提交补写；skip=跳过并移除（保持空白）。"""
+    global _worker
+    data = request.get_json(silent=True) or {}
+    rid = (data.get("id") or "").strip()
+    action = (data.get("action") or "").strip()
+    item = manager.find_refusal(rid)
+    if not item:
+        return jsonify({"ok": False, "message": "该项不存在或已被处理"}), 404
+
+    if action == "skip":
+        manager.remove_refusal(rid)
+        manager._log(f"⏭️ 已跳过拒答项：{item.get('label','')}（该部分保持空白）")
+        return jsonify({"ok": True, "message": "已跳过并移除（该部分保持空白）"})
+
+    if action != "resubmit":
+        return jsonify({"ok": False, "message": "未知操作"}), 400
+
+    if item.get("stage") not in ("layer4", "layer1"):
+        return jsonify({"ok": False,
+                        "message": "该阶段（大纲/场景）不支持单独补写，请用「继续上次」重跑"}), 400
+
+    ok, reason = _can_start()
+    if not ok:
+        return jsonify({"ok": False, "message": reason}), 409
+
+    cfg = load_config()
+    key = (data.get("api_key") or "").strip() or cfg.get("api_key", "")
+    if not key:
+        return jsonify({"ok": False, "message": "请填写 API Key（建议写入环境变量 NOVEL_AI_API_KEY）"})
+    base_url = (data.get("base_url") or "").strip() or cfg.get("base_url", DEFAULT_BASE_URL)
+    model = (data.get("model") or "").strip() or cfg.get("model", DEFAULT_MODEL)
+    # 发送内容：前端提交的编辑结果优先，其次用当初实际发出去的内容
+    edited = (data.get("edited") or "").strip() or item.get("prompt", "")
+
+    with _worker_lock:
+        _worker = RefusalResolver(item, edited, key, base_url, model)
+        _worker.start()
+    return jsonify({"ok": True, "message": "已开始补写（后台运行，可用「停止」中止）"})
 
 
 # ═══════════ API: 状态/内容/下载 ═══════════

@@ -19,11 +19,14 @@ from collections import deque
 from datetime import datetime
 
 from config import DEFAULT_CONFIRM_SECONDS
-from state import save_resume_state, load_resume_state, clear_resume_state, STATE_FILE
+from state import (save_resume_state, load_resume_state, clear_resume_state,
+                   load_refusals, save_refusals, STATE_FILE)
 
-# 引擎确认回调的三种保留结果，与 engine.py 保持一致
+# 引擎确认回调的保留结果，与 engine.py 保持一致
 RESULT_CANCEL = "__CANCEL__"
 RESULT_REGENERATE = "__REGENERATE__"
+RESULT_SKIP = "__SKIP__"          # 用户主动「跳过」：该部分留空，不登记待处理
+RESULT_TIMEOUT_SKIP = "__SKIP_TO__"  # 倒计时超时自动跳过：留空 + 登记待处理
 
 LOG_CAPACITY = 400          # 环形日志容量
 LOG_RETURN = 120            # 每次推送最多返回的日志条数
@@ -65,6 +68,13 @@ class JobManager:
         # 待确认项（引擎线程阻塞中）
         self.confirm = None          # dict 或 None
         self._confirm_seconds = confirm_seconds if confirm_seconds else DEFAULT_CONFIRM_SECONDS
+
+        # WS 订阅端计数：只有真的有前端在线，拒答才弹交互窗；
+        # 纯后台运行（无浏览器打开）时不打扰用户，改为登记待处理列表。
+        self._ws_count = 0
+
+        # 拒答待处理列表（持久化在数据目录，重启不丢）
+        self.refusals = load_refusals()
 
     # ── 工具 ──
     def _now(self) -> float:
@@ -117,24 +127,33 @@ class JobManager:
             self.task["stage_name"] = _STAGE_NAMES.get(state.get("stage"), self.task["stage_name"])
         self._bump()
 
-    def cb_confirm(self, title: str, content: str, prompt: str) -> str:
-        """引擎线程在此阻塞，直到倒计时结束或前端应答。返回引擎要的结果字符串。"""
+    def cb_confirm(self, title: str, content: str, prompt: str, kind: str = "normal") -> str:
+        """引擎线程在此阻塞，直到倒计时结束或前端应答。返回引擎要的结果字符串。
+
+        kind="refusal" 时语义不同：内容是被拒的「实际发送内容」（可编辑后重发），
+        倒计时结束**不**自动重发（否则会拿同样的内容无限撞拒答），而是跳过留空；
+        引擎收到 RESULT_TIMEOUT_SKIP 后会把这部分登记为待处理项。
+        """
         pc = {
             "id": int(self._now() * 1000),
             "title": title,
             "prompt": prompt,
             "content": content,
             "original": content,
+            "kind": kind,
             "created": self._now(),
             "deadline": self._now() + self._confirm_seconds,
             "duration": self._confirm_seconds,
             "status": "pending",     # pending | answered | timeout
             "result": None,          # 前端提交的最终结果字符串
-            "action": None,          # confirm | regenerate | cancel
+            "action": None,          # confirm | regenerate | cancel | skip
         }
         with self._lock:
             self.confirm = pc
-        self._log(f"⏸️ 等待确认：{title}（{self._confirm_seconds}秒后自动确认原文）")
+        if kind == "refusal":
+            self._log(f"⏸️ 等待用户处理拒答：{title}（{self._confirm_seconds}秒后自动跳过并登记待处理）")
+        else:
+            self._log(f"⏸️ 等待确认：{title}（{self._confirm_seconds}秒后自动确认原文）")
 
         # 阻塞等待：结果就绪(有锁里 result)或超时
         while True:
@@ -145,7 +164,17 @@ class JobManager:
                     return ans
                 timeout = pc["deadline"] - self._now()
             if timeout <= 0:
-                # 倒计时结束 → 自动确认原文
+                if pc["kind"] == "refusal":
+                    # 倒计时结束 → 跳过留空（绝不原样重发），登记交给引擎侧
+                    with self._lock:
+                        if pc["result"] is None:
+                            pc["status"] = "timeout"
+                            pc["action"] = "skip"
+                            pc["result"] = RESULT_TIMEOUT_SKIP
+                            self.confirm = None
+                    self._log(f"⏰ {title} 等待超时，自动跳过（该部分留空并登记待处理）")
+                    return RESULT_TIMEOUT_SKIP
+                # 普通确认：倒计时结束 → 自动确认原文
                 with self._lock:
                     if pc["result"] is None:
                         pc["status"] = "timeout"
@@ -159,7 +188,7 @@ class JobManager:
     # ── 供 Flask 调用 ──
 
     def answer_confirm(self, action: str, edited: str = None) -> bool:
-        """前端应答当前待确认项。action: confirm/regenerate/cancel。"""
+        """前端应答当前待确认项。action: confirm/regenerate/cancel/skip。"""
         with self._lock:
             pc = self.confirm
             if not pc or pc["status"] != "pending":
@@ -177,6 +206,9 @@ class JobManager:
             elif action == "cancel":
                 pc["result"] = RESULT_CANCEL
                 pc["action"] = "cancel"
+            elif action == "skip":
+                pc["result"] = RESULT_SKIP
+                pc["action"] = "skip"
             else:
                 return False
             pc["status"] = "answered"
@@ -185,7 +217,7 @@ class JobManager:
         return True
 
     def get_confirm_poll(self) -> dict | None:
-        """返回给前端的待确认项视图（不含大段全文?含，前端要展示编辑用）。"""
+        """返回给前端的待确认项视图（含全文，前端要展示编辑用）。"""
         with self._lock:
             pc = self.confirm
             if not pc or pc["status"] != "pending":
@@ -195,10 +227,78 @@ class JobManager:
                 "title": pc["title"],
                 "prompt": pc["prompt"],
                 "content": pc["content"],
+                "kind": pc.get("kind", "normal"),
                 "created": pc["created"],
                 "deadline": pc["deadline"],
                 "remaining": max(0.0, pc["deadline"] - self._now()),
             }
+
+    # ── WS 在线检测 ──
+
+    def register_ws(self):
+        with self._lock:
+            self._ws_count += 1
+
+    def unregister_ws(self):
+        with self._lock:
+            self._ws_count = max(0, self._ws_count - 1)
+
+    def has_ws_clients(self) -> bool:
+        """当前是否有前端在线（有 WS 订阅端）。引擎据此决定「实时弹窗」还是「登记待处理」。"""
+        with self._lock:
+            return self._ws_count > 0
+
+    # ── 拒答待处理列表 ──
+
+    def add_refusal(self, stage: str, label: str, chapters, prompt: str,
+                    refusal_text: str) -> dict:
+        """登记一条拒答待处理项（纯后台运行时调用），并持久化。"""
+        rec = {
+            "id": f"rf_{int(self._now() * 1000)}",
+            "stage": stage or "",
+            "label": label or "",
+            "chapters": list(chapters or []),
+            "prompt": prompt or "",
+            "refusal_text": refusal_text or "",
+            "created": self._now(),
+        }
+        with self._lock:
+            self.refusals.append(rec)
+            snapshot = list(self.refusals)
+        save_refusals(snapshot)
+        self._log(f"📌 已登记拒答待处理项：{rec['label']}（当前共 {len(snapshot)} 项，可在左侧「拒答待处理」中逐项处理）")
+        self._bump()
+        return rec
+
+    def get_refusal_items(self) -> list:
+        """完整项（含发送内容/拒答原文），供 /api/refusals。"""
+        with self._lock:
+            return [dict(r) for r in self.refusals]
+
+    def get_refusal_summary(self) -> list:
+        """精简项列表（不含大段文本），随状态帧下发。"""
+        with self._lock:
+            return [{"id": r.get("id", ""), "stage": r.get("stage", ""),
+                     "label": r.get("label", ""), "chapters": r.get("chapters", []),
+                     "created": r.get("created", 0)} for r in self.refusals]
+
+    def find_refusal(self, rid: str) -> dict | None:
+        with self._lock:
+            for r in self.refusals:
+                if r.get("id") == rid:
+                    return dict(r)
+        return None
+
+    def remove_refusal(self, rid: str) -> bool:
+        with self._lock:
+            before = len(self.refusals)
+            self.refusals = [r for r in self.refusals if r.get("id") != rid]
+            changed = len(self.refusals) != before
+            snapshot = list(self.refusals)
+        if changed:
+            save_refusals(snapshot)
+            self._bump()
+        return changed
 
     # ── 日志 / 状态拉取 ──
 
@@ -241,6 +341,7 @@ class JobManager:
                 "call_count": t["call_count"],
                 "log_seq": self._log_seq,
                 "confirm": self.get_confirm_poll(),
+                "refusals": self.get_refusal_summary(),
             }
             if with_content:
                 status["content_tail"] = t["latest_content"][-CONTENT_TAIL:]
@@ -290,7 +391,7 @@ class JobManager:
         self._bump()
 
     def mark_stopped(self):
-        """用户手动停止（非错误），保留断点供续传。"""
+        """用户手动停止 / 后端不可用提前结束（非错误），保留断点供续传。"""
         with self._lock:
             t = self.task
             t["running"] = False
@@ -298,7 +399,33 @@ class JobManager:
             t["finished"] = True
             t["stage_name"] = "已停止（可续传）"
             t["last_error"] = ""
+            # 断点标记按磁盘实际情况刷新：否则前端「继续上次」可能读到停止前的旧值
+            t["has_resume"] = load_resume_state() is not None
         self._log("🛑 已手动停止，进度已保留可续传")
+        self._bump()
+
+    def mark_incomplete(self, missing: list, novel_title: str = "", result_file: str = ""):
+        """任务结束但存在未生成（拒答/失败留空）的章节：不算完成。
+
+        与 mark_done 的关键差别：
+        - 不清断点（has_resume=True），用户可续传补写；
+        - 进度停 99%、阶段名显式标注缺章，前端不会显示「✅ 完成」。
+        """
+        with self._lock:
+            t = self.task
+            t["running"] = False
+            t["stopping"] = False
+            t["finished"] = True
+            t["stage"] = "layer4"
+            t["stage_name"] = f"部分完成（缺{len(missing)}章）"
+            t["progress"] = 99
+            head = "、".join(f"第{c}章" for c in missing[:8])
+            more = f" 等{len(missing)}章" if len(missing) > 8 else ""
+            t["progress_text"] = f"未完成：{head}{more}留空，可续传补写"
+            t["novel_title"] = novel_title
+            t["result_file"] = result_file
+            t["has_resume"] = True
+        self._log(f"⚠️ 任务未完成：{len(missing)} 章留空 {missing}，断点已保留，可「继续上次」补写")
         self._bump()
 
     def set_has_resume(self, val: bool):

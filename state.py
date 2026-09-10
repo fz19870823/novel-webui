@@ -32,6 +32,7 @@ from config import DATA_DIR
 STATE_FILE = os.path.join(DATA_DIR, "novel_resume_state.json")
 CHAPTER_DIR = os.path.join(DATA_DIR, "novel_resume_chapters")
 STATIC_DIR = os.path.join(DATA_DIR, "novel_resume_static")
+REFUSAL_FILE = os.path.join(DATA_DIR, "novel_refusals.json")
 
 _CHAPTER_KEY = "chapters"        # 对外仍以 chapters 字典暴露，引擎无感
 _INDEX_KEY = "chapters_index"    # {"1": "<sha1>", ...} 章节号 → 分片
@@ -188,3 +189,31 @@ def clear_resume_state():
                 os.rmdir(d)
             except OSError:
                 pass
+
+
+# ═══════════════════════════════════════════════════
+#  拒答待处理列表（纯后台运行时登记，用户上线后逐项处理）
+#
+#  与断点分离：断点管"生成到哪了"，本列表管"哪些部分被模型拒答、
+#  实际发出去的内容是什么、拒答原文是什么"。持久化在数据目录，
+#  重启不丢；用户处理完一项即从列表移除。
+# ═══════════════════════════════════════════════════
+
+def load_refusals() -> list:
+    """读取拒答待处理列表；文件不存在/损坏时返回空列表。"""
+    if not os.path.exists(REFUSAL_FILE):
+        return []
+    try:
+        data = _read_json(REFUSAL_FILE)
+        return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[WARN] 读取拒答待处理列表失败: {e}")
+        return []
+
+
+def save_refusals(items: list):
+    """原子写拒答待处理列表。"""
+    try:
+        _write_atomic(REFUSAL_FILE, json.dumps(items, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(f"[WARN] 保存拒答待处理列表失败: {e}")

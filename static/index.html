@@ -95,6 +95,7 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 .m-head h2{font-size:15px;flex:1}
 .countdown{background:var(--accent);color:#fff;padding:3px 10px;border-radius:14px;font-size:13px;font-family:var(--mono)}
 .m-prompt{padding:10px 20px;color:var(--warn);background:#2a2416;border-bottom:1px solid var(--line);font-size:13px;line-height:1.6;overflow-wrap:anywhere;word-break:break-word}
+.m-prompt.refusal{max-height:32vh;overflow:auto;border-left:3px solid var(--err);word-break:break-word;white-space:pre-wrap}
 .m-body{padding:16px 20px;flex:1;overflow:auto}
 .m-body textarea{width:100%;height:100%;min-height:280px;font-family:var(--mono);font-size:12.5px;line-height:1.7}
 .m-foot{padding:14px 20px;border-top:1px solid var(--line);display:flex;gap:10px;justify-content:flex-end}
@@ -109,6 +110,12 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 .dl-list .file .n{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dl-list .file .m{color:var(--muted);font-size:12px;font-family:var(--mono)}
 .dl-list .file a{color:var(--accent);font-size:13px;text-decoration:none}
+/* 拒答待处理列表 */
+.sect h3 .cnt{background:var(--err);color:#fff;border-radius:10px;padding:1px 8px;font-size:11px;margin-left:auto}
+.ref-item{padding:9px 10px;border:1px solid var(--line);border-left:3px solid var(--err);border-radius:8px;margin-bottom:8px;background:var(--panel2);cursor:pointer;transition:.15s}
+.ref-item:hover{border-color:var(--accent);border-left-color:var(--err)}
+.ref-item .t{font-size:13px;margin-bottom:4px;overflow-wrap:anywhere;word-break:break-word}
+.ref-item .m{color:var(--muted);font-size:11px;font-family:var(--mono)}
 .sect h3 .mini-btn{background:none;border:none;color:var(--muted);cursor:pointer;font-size:15px;line-height:1;margin-left:auto;padding:0 4px}
 .sect h3 .mini-btn:hover{color:var(--accent)}
 ::-webkit-scrollbar{width:9px;height:9px}
@@ -227,6 +234,13 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
       </div>
     </div>
 
+    <!-- 拒答待处理（仅在存在拒答项时显示） -->
+    <div class="sect" id="refusalSect" style="display:none">
+      <h3>🚫 拒答待处理<span class="cnt" id="refusalCnt">0</span></h3>
+      <div class="hint" style="margin-bottom:8px">后台运行时被模型拒答的部分已留空并登记在此：点开可查看实际发送内容与拒答原文，修改后重新提交补写，或跳过保持空白。</div>
+      <div class="dl-list" id="refusalList"></div>
+    </div>
+
     <!-- 成品 -->
     <div class="sect" data-page-node-id="ltI3gDHEDaFwUycvDHiPdD">
       <h3 data-page-node-id="7iMzXQkeHk3tLPcLmrkRrv">📁 已生成小说<button class="mini-btn" id="btnRefreshFiles" title="刷新成品列表" data-page-node-id="miniRefresh">⟳</button></h3>
@@ -280,8 +294,9 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 // ── 常量与状态 ──
 let S = { running:false, stopping:false, wsUp:false, confirmTimer:null,
           confirmSeen:null, cfgLoaded:false, currentTab:'content', cfg:null, models:[],
-          modelIdx:-1, lastFile:'', lastContent:'' };
+          modelIdx:-1, lastFile:'', lastContent:'', refusalCount:-1 };
 const $ = id => document.getElementById(id);
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const api = (path, opts) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts))
   .then(r=>{
     if(r.status===401){                       // 会话过期/未登录 → 回登录页
@@ -396,38 +411,115 @@ function applyStatus(st){
     $('btnResume').disabled = !st.has_resume;
   }
   setWsState(true);   // 顶栏运行点 + 状态文字与推送同步
+  renderRefusals(st.refusals);
   // 确认弹窗：有新的待确认项且当前没有更晚的项在展示
-  if(st.confirm && (!activeConfirm || st.confirm.id !== activeConfirm.id)){
+  if(st.confirm && (!activeConfirm || activeConfirm.id !== st.confirm.id)){
     openConfirm(st.confirm);
-  } else if(!st.confirm){
+  } else if(!st.confirm && activeConfirm && activeConfirm.source === 'server'){
     closeConfirm();
   }
+}
+
+// ── 拒答待处理列表 ──
+function renderRefusals(list){
+  list = list || [];
+  const sig = list.map(r=>r.id).join(',');
+  if(sig === S._refusalSig) return;      // 列表未变不重绘（流式期间每帧推送，重绘会致闪烁/点击失效）
+  S._refusalSig = sig;
+  const el = $('refusalList');
+  $('refusalCnt').textContent = list.length;
+  $('refusalSect').style.display = list.length ? '' : 'none';
+  el.innerHTML = list.map(r=>
+    `<div class="ref-item" data-id="${esc(r.id)}">
+       <div class="t">🚫 ${esc(r.label || r.stage || '拒答项')}</div>
+       <div class="m">${new Date((r.created||0)*1000).toLocaleString()} · 点击处理</div>
+     </div>`).join('');
+  el.querySelectorAll('.ref-item').forEach(d=>{ d.onclick = ()=>openRefusalById(d.dataset.id); });
+  if(S.refusalCount !== -1 && list.length > S.refusalCount){
+    toast(`有 ${list.length} 项模型拒答待处理，请在左侧列表处理`, true);
+  }
+  S.refusalCount = list.length;
+}
+async function openRefusalById(id){
+  try{
+    const d = await (await api('/api/refusals')).json();
+    const it = (d.items||[]).find(x=>x.id===id);
+    if(it) openRefusalModal(it); else toast('该项已被处理', true);
+  }catch(e){ toast('读取拒答项失败', true); }
+}
+function openRefusalModal(item){
+  const support = item.stage === 'layer4' || item.stage === 'layer1';
+  activeConfirm = { source:'refusal', id:item.id, kind:'item', stage:item.stage, deadline:0 };
+  $('cTitle').textContent = '拒答待处理：' + (item.label || item.stage || '');
+  $('cPrompt').textContent =
+    '模型连续拒答 3 次后留空。下方为**当初实际发送的内容**（可修改，例如弱化敏感表述），'
+    + '点「重新提交」即用它补写该部分；「跳过」则保持空白并移除本项。\n'
+    + '──────── 模型拒答原文 ────────\n' + (item.refusal_text || '（空）');
+  $('cPrompt').classList.add('refusal');
+  $('cText').value = item.prompt || '';
+  $('cConfirm').textContent = '重新提交';
+  $('cConfirm').disabled = !support;
+  $('cRe').textContent = '跳过（留空）';
+  $('cCancel').textContent = '关闭';
+  $('cCount').textContent = '';
+  $('cTip').textContent = support
+    ? '补写在后台运行；若仍被拒答，该项会保留在列表中'
+    : '该阶段不支持单独补写：请用「继续上次」重跑管线';
+  $('mask').classList.add('show');
 }
 
 // ── 确认弹窗逻辑 ──
 let activeConfirm = null, confirmDeadline = 0;
 function openConfirm(c){
-  activeConfirm = c; confirmDeadline = c.deadline;
+  activeConfirm = { source:'server', id:c.id, kind:c.kind||'normal', deadline:c.deadline };
+  confirmDeadline = c.deadline;
+  const refusal = activeConfirm.kind === 'refusal';
   $('cTitle').textContent = c.title;
   $('cPrompt').textContent = c.prompt;
+  $('cPrompt').classList.toggle('refusal', refusal);
   $('cText').value = c.content;
+  // 拒答模式：编辑框内容 = 实际发送给模型的内容；按钮语义随之切换
+  $('cConfirm').textContent = refusal ? '用修改后的内容重发' : '确认使用';
+  $('cConfirm').disabled = false;
+  $('cRe').textContent = refusal ? '原样重发' : '重新生成';
+  $('cCancel').textContent = refusal ? '跳过（留空）' : '取消（停止生成）';
   $('mask').classList.add('show');
   renderCountdown();
 }
 function closeConfirm(){
   if(activeConfirm) activeConfirm=null;
   $('mask').classList.remove('show');
+  $('cPrompt').classList.remove('refusal');
+  $('cConfirm').disabled = false;
 }
 function renderCountdown(){
   if(!activeConfirm) return;
+  // 拒答待处理项是离线登记、用户主动打开的，不参与倒计时
+  if(activeConfirm.source === 'refusal'){
+    $('cCount').textContent = '';
+    return;
+  }
   const rem = Math.max(0, confirmDeadline - Date.now()/1000);
   $('cCount').textContent = Math.ceil(rem)+'s';
-  $('cTip').textContent = rem<=0 ? '' : '倒计时结束将自动确认原文';
+  $('cTip').textContent = rem<=0 ? ''
+    : (activeConfirm.kind==='refusal' ? '倒计时结束将自动跳过（该部分留空并登记待处理）'
+                                      : '倒计时结束将自动确认原文');
   clearTimeout(activeConfirm._t);
   activeConfirm._t = setTimeout(renderCountdown, 300);
 }
 
 async function sendConfirm(action, edited){
+  // ① 拒答待处理项：走补写/跳过接口
+  if(activeConfirm && activeConfirm.source === 'refusal'){
+    if(action === 'close'){ closeConfirm(); return; }
+    const body = { id: activeConfirm.id, action,
+                   edited: action === 'resubmit' ? $('cText').value : undefined };
+    const r = await (await api('/api/refusal/resolve',{method:'POST',body:JSON.stringify(body)})).json();
+    if(!r.ok){ toast(r.message,true); return; }
+    toast(r.message); closeConfirm();
+    return;
+  }
+  // ② 引擎阻塞中的确认项
   const body = {action, edited: action==='confirm' ? $('cText').value : undefined};
   const r = await (await api('/api/confirm',{method:'POST',body:JSON.stringify(body)})).json();
   if(!r.ok) toast(r.message,true);
@@ -435,9 +527,15 @@ async function sendConfirm(action, edited){
 }
 
 // 点击遮罩不关闭（避免误操作）；按钮操作
-$('cConfirm').onclick = ()=>sendConfirm('confirm');
-$('cRe').onclick = ()=>sendConfirm('regenerate');
-$('cCancel').onclick = ()=>sendConfirm('cancel');
+$('cConfirm').onclick = ()=>sendConfirm(
+  activeConfirm && activeConfirm.source === 'refusal' ? 'resubmit' : 'confirm');
+$('cRe').onclick = ()=>sendConfirm(
+  activeConfirm && activeConfirm.source === 'refusal' ? 'skip' : 'regenerate');
+$('cCancel').onclick = ()=>{
+  if(!activeConfirm) return closeConfirm();
+  if(activeConfirm.source === 'refusal') return sendConfirm('close');
+  return sendConfirm(activeConfirm.kind === 'refusal' ? 'skip' : 'cancel');
+};
 
 // ── 标签切换 ──
 document.querySelectorAll('.tab').forEach(t=>{
