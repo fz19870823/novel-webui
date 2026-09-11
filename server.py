@@ -91,15 +91,9 @@ class WsClient:
         self.seq = 0       # 已推日志 seq
         self.clen = -1     # 已推正文「全文」长度（-1 = 尚未推）
         self.alive = True
-        # 在线计数只减一次：发送线程与 handler 线程都会走到 close()
-        self.registered = True
-        manager.register_ws()
 
     def close(self):
         self.alive = False
-        if self.registered:
-            self.registered = False
-            manager.unregister_ws()
         with manager._cond:
             manager._cond.notify_all()
 

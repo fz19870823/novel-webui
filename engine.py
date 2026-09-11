@@ -86,16 +86,22 @@ def _looks_like_refusal(text: str) -> bool:
 # 与 controller.py 保持一致的特殊结果字符串
 RESULT_CANCEL = "__CANCEL__"          # 用户取消（中止任务）
 RESULT_REGENERATE = "__REGENERATE__"  # 用户要求原样重发
-RESULT_SKIP = "__SKIP__"              # 用户主动跳过：该部分留空，不登记待处理
-RESULT_TIMEOUT_SKIP = "__SKIP_TO__"   # 倒计时超时自动跳过：留空 + 登记待处理
 
 
 class RefusalSkipped(Exception):
-    """模型拒答后本次调用无产出（用户跳过、超时跳过、或后台运行登记待处理）。
+    """模型连续拒答后本次调用无产出（已登记为「拒答待处理」项，该部分留空）。
 
     layer4 写作阶段捕获后对应章节保留空白（不重试、不填充）；layer1-3 前置阶段
     无法留空继续，向上冒泡使任务中止（断点与拒答记录均已保存）。
+
+    异常自带本次「实际发送内容」与「拒答原文」，供上层记录：
+    「重新提交」补写（RefusalResolver）再次被拒时就用它登记新一条待处理。
     """
+
+    def __init__(self, refusal_text: str = "", prompt: str = ""):
+        super().__init__("模型拒答")
+        self.refusal_text = refusal_text or ""
+        self.prompt = prompt or ""
 
 
 # ==============================
@@ -110,7 +116,6 @@ class NovelGenerator:
                  state_callback: Callable = None,
                  content_callback: Callable = None,
                  refusal_callback: Callable = None,
-                 viewer_check: Callable = None,
                  resume_state: Dict = None,
                  chapters_count: int = None,
                  words_per_chapter: int = None,
@@ -127,10 +132,9 @@ class NovelGenerator:
         self.confirm_callback = confirm_callback
         self.state_callback = state_callback
         self.content_callback = content_callback
-        # 拒答登记回调（无前端在线时把"被拒的部分"存进待处理列表）
+        # 拒答登记回调：模型拒答时把「实际发送内容 + 拒答原文」存进待处理列表，
+        # 由用户在列表里统一处理（不再区分有没有前端在线，也不向前端弹窗）。
         self.refusal_callback = refusal_callback
-        # 前端在线检测：True 才弹交互窗；False = 纯后台运行，登记待处理即可
-        self.viewer_check = viewer_check
 
         # 当前调用上下文（供拒答时标注"哪个阶段/哪几章"）
         self._ctx: Dict = {"stage": "", "chapters": []}
@@ -417,23 +421,12 @@ class NovelGenerator:
                         time.sleep(2 ** attempt)
                         continue
 
-                    # ── 自动重试 3 次仍拒答：分「有前端在线」与「纯后台运行」两条路 ──
-                    if self.confirm_callback and self._viewer_online():
-                        # 有人在看 → 直接推给前端：用户可查看拒答原文、修改发送内容后重发
-                        decision, need_record = self._refusal_interact(prompt, content)
-                        if decision is None:
-                            if need_record:
-                                self._record_refusal(prompt, content)
-                            raise RefusalSkipped()
-                        if decision != prompt:
-                            self._log("✏️ 使用用户修改后的发送内容重新提交（重试次数已重置）")
-                        return self.call_grok(decision, max_tokens=max_tokens,
-                                              temperature=temperature, show_stream=show_stream)
-
-                    # 无前端在线（后台运行）→ 不打扰用户：登记待处理（持久化），该部分留空
-                    self._log("📴 当前无前端在线，登记拒答待处理项，本次调用留空")
+                    # ── 自动重试 3 次仍拒答：一律登记到「拒答待处理」列表并留空 ──
+                    # 不再区分有没有前端在线、也不向前端弹交互窗：统一登记，
+                    # 用户上线后在列表里查看发送内容与拒答原文，改后重新提交或忽略删除。
+                    self._log("📌 模型连续拒答，登记为拒答待处理项，本次调用留空")
                     self._record_refusal(prompt, content)
-                    raise RefusalSkipped()
+                    raise RefusalSkipped(content, prompt)
 
                 self._log(f"📊 累计调用: {self.call_count} 次 (流式 {len(content)} 字)")
                 return content
@@ -482,19 +475,7 @@ class NovelGenerator:
                     raise
         return ""
 
-    # ── 用户确认 ──
-
-    def _viewer_online(self) -> bool:
-        """是否有前端在线。
-
-        没接 viewer_check 时退化为"有 confirm_callback 就当有人看"（兼容独立使用）。
-        """
-        if not self.viewer_check:
-            return bool(self.confirm_callback)
-        try:
-            return bool(self.viewer_check())
-        except Exception:
-            return False
+    # ── 拒答登记 ──
 
     _STAGE_CN = {"layer1": "设定圣经", "layer2": "章节大纲", "layer3": "场景分解",
                  "layer4": "正文写作", "title": "小说名"}
@@ -511,7 +492,10 @@ class NovelGenerator:
         return f"{base} · 第{chs[0]}-{chs[-1]}章"
 
     def _record_refusal(self, prompt: str, refusal_text: str):
-        """无前端在线：把被拒的部分登记进待处理列表（持久化），等用户上线后逐项处理。"""
+        """把被拒的部分登记进待处理列表（持久化），用户上线后逐项处理。
+
+        无论有没有前端在线都走这条路：拒答不弹窗、不进流程，只登记 + 本次留空。
+        """
         if not self.refusal_callback:
             return
         try:
@@ -519,37 +503,6 @@ class NovelGenerator:
                                   list(self._ctx.get("chapters") or []), prompt, refusal_text)
         except Exception as e:
             self._log(f"⚠️ 登记拒答待处理项失败: {e}")
-
-    def _refusal_interact(self, prompt: str, refusal_text: str):
-        """有前端在线：弹确认窗让用户查看拒答原文、修改发送内容后重发。
-
-        返回 (decision, record)：
-        - (修改后的 prompt, False) —— 用户编辑后重新提交，或原样重发
-        - (None, False)  —— 用户主动跳过（留空，不登记）
-        - (None, True)   —— 倒计时超时跳过（留空，登记待处理）
-        用户点「取消」→ 直接抛异常中止任务。
-        """
-        self._log("🚫 模型连续拒答，推送到前端等待用户处理…")
-        result = self.confirm_callback(
-            "模型拒答：请查看并修改发送内容后重新提交",
-            prompt,
-            "模型自动重试 3 次仍拒答。下方为本次实际发送的内容，可修改（例如弱化敏感表述）后重新提交；"
-            "「原样重发」不改内容直接重试；「跳过」则本次调用无产出（写作阶段对应章节保留空白）。\n"
-            "──────── 模型拒答原文 ────────\n" + (refusal_text or "（空）"),
-            kind="refusal",
-        )
-        if result == RESULT_CANCEL:
-            self.is_running = False
-            raise Exception("用户取消生成")
-        if result == RESULT_SKIP:
-            self._log("⏭️ 用户选择跳过，该部分保留空白")
-            return None, False
-        if result == RESULT_TIMEOUT_SKIP:
-            self._log("⏰ 等待超时，该部分保留空白并登记为待处理")
-            return None, True
-        if result == RESULT_REGENERATE:
-            return prompt, False
-        return (result or prompt), False
 
     def _confirm_with_user(self, title: str, content: str, prompt: str = "") -> str:
         """弹出确认窗口，让用户确认或修改内容"""

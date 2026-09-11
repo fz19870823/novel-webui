@@ -4,10 +4,9 @@ novel-webui 生成 worker
 用户可随时 stop()；stop 只在引擎下一个检查点生效（进行中的单次 API 流式调用需返回后才中止），
 与原 GUI 语义一致。
 
-拒答语义（两条路）：
-- 有前端在线（WS 订阅端存在）→ 引擎弹确认窗，用户查看/修改发送内容后重发，或跳过留空；
-- 无前端在线（纯后台运行）→ 不打扰用户，把被拒的部分登记进「拒答待处理」列表
-  （持久化在数据目录），该部分留空继续；用户上线后逐项处理（见 RefusalResolver）。
+拒答语义（统一一条路）：
+- 模型连续拒答 3 次 → 一律把被拒的部分登记进「拒答待处理」列表（持久化在数据目录），
+  该部分留空继续；不向前端弹窗，用户上线后在列表里逐项处理（见 RefusalResolver）。
 - 只要存在留空章节，任务就不会被标记完成（mark_incomplete），断点保留可续传。
 """
 
@@ -100,7 +99,6 @@ class GeneratorWorker:
                 state_callback=manager.cb_state,
                 content_callback=manager.cb_content,
                 refusal_callback=manager.add_refusal,
-                viewer_check=manager.has_ws_clients,
                 resume_state=resume_state,
                 chapters_count=self.chapters_count,
                 words_per_chapter=self.words_per_chapter,
@@ -161,8 +159,10 @@ class RefusalResolver:
     与 GeneratorWorker 同构（start/stop/is_alive + 后台线程），复用同一套 manager
     回调，所以前端日志/实时正文/断点语义完全一致；补写期间同样可用 /api/stop 中止。
 
-    补写过程中若再次被拒答：不重复登记（原待处理项保留），直接标记失败，
-    用户可继续修改发送内容重试 —— 避免同一条拒答在列表里滚雪球。
+    补写过程中再次被拒答：把**这一次**实际发送的内容与拒答原文登记成新的一条
+    待处理项（attempt+1，挂在同一条 root 链上），原项保留 —— 用户可以对照多次
+    尝试的发送内容与拒答原文，继续分析为什么还是被拒。补写成功后同一条链上的
+    记录会一起清掉，不留下已过期的中间记录。
     """
 
     def __init__(self, item: dict, prompt: str, api_key: str,
@@ -196,6 +196,11 @@ class RefusalResolver:
         item_id = self.item.get("id", "")
         label = self.item.get("label", "")
         stage = self.item.get("stage", "")
+        root_id = self.item.get("root_id") or item_id      # 同一条「尝试链」的链首 id
+        try:
+            prev_attempt = int(self.item.get("attempt", 1) or 1)
+        except (TypeError, ValueError):
+            prev_attempt = 1
         chapters = []
         for c in (self.item.get("chapters") or []):
             try:
@@ -229,13 +234,13 @@ class RefusalResolver:
                 model=self.model,
                 progress_callback=manager.cb_progress,
                 log_callback=manager.cb_log,
-                # 不挂确认窗：补写期间不再弹交互（避免用户在弹窗里再点弹窗），
-                # 一旦再次拒答就走"留空"路径并退出，原待处理项保留。
+                # 不挂确认窗：补写期间不再弹交互（避免用户在弹窗里再点弹窗）。
+                # 再次拒答的 RefusalSkipped 会冒泡到下面，由本类自己登记成新的一条待处理项
+                # （带本次发送内容与拒答原文），所以引擎侧的 refusal_callback 保持 None 防重复登记。
                 confirm_callback=None,
                 state_callback=manager.cb_state,
                 content_callback=manager.cb_content,
                 refusal_callback=None,
-                viewer_check=lambda: False,
                 resume_state=state,
             )
             gen = self._generator
@@ -246,10 +251,14 @@ class RefusalResolver:
                 ok = bool(gen.fill_chapters_from_prompt(self.prompt, chapters))
 
             if not ok:
-                manager.mark_error("补写仍被拒答或无产出，该项保留在待处理列表中（可修改发送内容后重试）")
+                manager.mark_error("补写未产出可用内容（非拒答，可能是输出无法解析），"
+                                   "该项保留在待处理列表中（可修改发送内容后重试）")
                 return
 
-            manager.remove_refusal(item_id)
+            # 补写成功 → 连同这条链上此前失败尝试的记录一起清掉
+            n = manager.remove_refusals_by_root(root_id)
+            if n > 1:
+                manager._log(f"🧹 已清理同一条拒答链上的 {n} 条记录（含之前的失败尝试）")
             missing = gen.missing_chapters()
             story = gen._merge_to_novel()
             filename = _write_novel_file(gen.novel_title or "", story, prev=prev_file)
@@ -258,8 +267,15 @@ class RefusalResolver:
             else:
                 manager.mark_done(gen.novel_title or "", filename)
                 manager._log(f"🎉 全部章节已补齐，成品已更新：{filename}")
-        except RefusalSkipped:
-            manager.mark_error("补写仍被模型拒答，该项保留在待处理列表中（可修改发送内容后重试）")
+        except RefusalSkipped as e:
+            # 再次拒答：登记新的一条（attempt+1），让用户能看到这次到底发了什么、被什么理由拒了
+            rec = manager.add_refusal(
+                stage, label, chapters,
+                e.prompt or self.prompt, e.refusal_text,
+                meta={"attempt": prev_attempt + 1, "root_id": root_id, "parent_id": item_id},
+            )
+            manager.mark_error("补写仍被模型拒答：已把本次发送的内容与拒答原文登记为新的一条"
+                               f"待处理项（第{rec.get('attempt', 2)}次尝试），可继续对照修改后重试")
         except Exception as e:
             manager.mark_error(f"补写失败：{e}")
         finally:
