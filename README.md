@@ -220,9 +220,12 @@ example.com {
 | GET  | `/api/status?content=1` | 状态+确认项+正文尾部（兼容保留，前端已走 /ws） |
 | GET  | `/api/logs?since=N` | 增量日志（兼容保留，前端已走 /ws） |
 | GET  | `/api/files` | 成品列表 |
+| POST | `/api/files/delete` | 删除成品（单个/批量，`{names:[...]}`；返回 `{deleted,failed}`） |
 | GET  | `/api/download/xxx.txt` | 下载成品 |
 
 > 除标记「公开」的路径外，其余全部需要登录（session cookie）；`/ws` 未登录在握手阶段即拒绝。
+> `/api/files/delete` 只接受成品命名（`标题_时间戳.txt` / `novel_*.txt` / `log_*.txt`），
+> 逐个处理并校验解析后路径仍在数据目录内，连同同名 `.bak` 备份一起清理；部分失败不影响其余文件。
 
 ## WebSocket 推送协议
 

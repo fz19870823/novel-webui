@@ -629,9 +629,26 @@ def api_refusals():
     return jsonify({"items": manager.get_refusal_items()})
 
 
+@app.route("/api/refusals/clear", methods=["POST"])
+def api_refusals_clear():
+    """忽略并删除全部拒答待处理项。
+
+    典型用法：准备从第 N 章重跑，第 N 章之后的正文会被重新生成，
+    这些旧记录（描述的是当初发出去的内容）已无意义，一次性清掉。
+    """
+    n = manager.clear_refusals()
+    if n:
+        manager._log(f"🧹 已忽略并删除全部 {n} 项拒答记录（空白章保持空白，可从对应阶段重跑）")
+    return jsonify({"ok": True, "message": f"已忽略并删除 {n} 项拒答记录"})
+
+
 @app.route("/api/refusal/resolve", methods=["POST"])
 def api_refusal_resolve():
-    """处理一条拒答项：resubmit=用（可修改的）发送内容重新提交补写；skip=跳过并移除（保持空白）。"""
+    """处理一条拒答项。
+
+    resubmit = 用（可修改的）发送内容重新提交补写；
+    skip / ignore = 删除该项、该部分保持空白（ignore 用于「稍后从某章重跑，记录已多余」的场景）。
+    """
     global _worker
     data = request.get_json(silent=True) or {}
     rid = (data.get("id") or "").strip()
@@ -640,10 +657,11 @@ def api_refusal_resolve():
     if not item:
         return jsonify({"ok": False, "message": "该项不存在或已被处理"}), 404
 
-    if action == "skip":
+    if action in ("skip", "ignore"):
         manager.remove_refusal(rid)
-        manager._log(f"⏭️ 已跳过拒答项：{item.get('label','')}（该部分保持空白）")
-        return jsonify({"ok": True, "message": "已跳过并移除（该部分保持空白）"})
+        verb = "忽略并删除" if action == "ignore" else "跳过并移除"
+        manager._log(f"⏭️ 已{verb}拒答项：{item.get('label','')}（该部分保持空白，可从该阶段重跑）")
+        return jsonify({"ok": True, "message": f"已{verb}（该部分保持空白，可从该阶段重跑）"})
 
     if action != "resubmit":
         return jsonify({"ok": False, "message": "未知操作"}), 400
@@ -697,6 +715,64 @@ def api_files():
                           "mtime": os.path.getmtime(p)})
     files.sort(key=lambda x: x["mtime"], reverse=True)
     return jsonify({"files": files})
+
+
+@app.route("/api/files/delete", methods=["POST"])
+def api_files_delete():
+    """删除成品文件（单个或批量）。
+
+    安全边界与下载一致：只接受数据目录内、名字符合成品规则（标题_时间戳.txt /
+    novel_*.txt / log_*.txt）的文件，且解析后必须仍在数据目录内（防路径穿越、
+    防符号链接逃逸）。删除主文件时连同同名 .bak 备份一并清理，不留垃圾。
+
+    部分失败不影响其余文件：逐个处理，结果分 deleted / failed 返回。前端只提示失败项。
+    """
+    data = request.get_json(silent=True) or {}
+    raw_names = data.get("names")
+    if not isinstance(raw_names, list):
+        return jsonify({"error": "names 必须是数组"}), 400
+
+    # 去重并丢弃空项，保持调用方顺序
+    names, seen = [], set()
+    for n in raw_names:
+        n = str(n or "")
+        if n and n not in seen:
+            seen.add(n)
+            names.append(n)
+    if not names:
+        return jsonify({"error": "未提供文件名"}), 400
+
+    root = os.path.realpath(DATA_DIR)
+    deleted, failed = [], []
+    for raw in names:
+        name = os.path.basename(raw)
+        if name != raw or not is_output_name(name):
+            failed.append({"name": raw, "error": "文件名非法或不属于可删除的成品类型"})
+            continue
+        p = os.path.join(DATA_DIR, name)
+        if not os.path.realpath(p).startswith(root + os.sep):
+            failed.append({"name": name, "error": "路径非法"})
+            continue
+        if not os.path.exists(p):
+            failed.append({"name": name, "error": "文件不存在（可能已被删除）"})
+            continue
+        try:
+            os.remove(p)
+        except OSError as e:
+            failed.append({"name": name, "error": f"删除失败：{e}"})
+            continue
+        # 同名 .bak（_write_novel_file 覆盖前的备份）不属于列表可见文件，一并清掉
+        bak = p + ".bak"
+        if os.path.exists(bak):
+            try:
+                os.remove(bak)
+            except OSError as e:
+                print(f"[WARN] 删除备份文件失败 {bak}: {e}")
+        deleted.append(name)
+
+    if deleted:
+        manager.forget_result_file(deleted)
+    return jsonify({"deleted": deleted, "failed": failed})
 
 
 @app.route("/api/download/<path:filename>")

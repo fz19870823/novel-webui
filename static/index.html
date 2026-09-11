@@ -111,10 +111,19 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #toast.err{border-color:var(--err)} #toast.err::before{content:"⚠ ";color:var(--err)}
 
-.dl-list .file{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px;background:var(--panel2)}
-.dl-list .file .n{flex:1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dl-list .file .m{color:var(--muted);font-size:12px;font-family:var(--mono)}
+.dl-list .file{display:flex;flex-direction:column;gap:7px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px;background:var(--panel2)}
+/* 两段式：上行「勾选框 + 完整文件名（可换行）」，下行「大小 + 下载 + 删除」 */
+.dl-list .file .f-top{display:flex;align-items:flex-start;gap:8px}
+.dl-list .file .n{flex:1;min-width:0;font-size:13px;overflow-wrap:anywhere;word-break:break-word;line-height:1.45}
+.dl-list .file .f-ops{display:flex;align-items:center;gap:10px;padding-left:23px}
+.dl-list .file .m{color:var(--muted);font-size:12px;font-family:var(--mono);margin-right:auto}
 .dl-list .file a{color:var(--accent);font-size:13px;text-decoration:none}
+/* 成品删除：行内勾选框 + 删除按钮（勾选后可批量删；标题栏的按钮靠右成组） */
+.dl-list .file .fs{width:15px;height:15px;flex:none;accent-color:var(--accent);color-scheme:dark;cursor:pointer}
+.dl-list .file .del-btn{background:none;border:1px solid var(--line);color:var(--muted);font-size:12px;padding:3px 9px;border-radius:6px;transition:.15s;flex:none}
+.dl-list .file .del-btn:hover{color:var(--err);border-color:var(--err)}
+.sect h3 .hdr-actions{margin-left:auto;display:flex;align-items:center;gap:6px}
+.sect h3 .hdr-actions .mini-btn{margin-left:0}
 /* 拒答待处理列表 */
 .sect h3 .cnt{background:var(--err);color:#fff;border-radius:10px;padding:1px 8px;font-size:11px;margin-left:auto}
 .ref-item{padding:9px 10px;border:1px solid var(--line);border-left:3px solid var(--err);border-radius:8px;margin-bottom:8px;background:var(--panel2);cursor:pointer;transition:.15s}
@@ -123,6 +132,9 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 .ref-item .m{color:var(--muted);font-size:11px;font-family:var(--mono)}
 .sect h3 .mini-btn{background:none;border:none;color:var(--muted);cursor:pointer;font-size:15px;line-height:1;margin-left:auto;padding:0 4px}
 .sect h3 .mini-btn:hover{color:var(--accent)}
+.sect h3 .link-btn{background:none;border:1px solid var(--line);color:var(--muted);cursor:pointer;font-size:11px;padding:2px 7px;border-radius:6px;margin-left:6px;white-space:nowrap;transition:.15s}
+.sect h3 .link-btn:hover{color:var(--err);border-color:var(--err)}
+.sect h3 .link-btn.armed{color:var(--err);border-color:var(--err);background:#4a2730}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
 ::-webkit-scrollbar-thumb:hover{background:#3a4056}
@@ -169,9 +181,10 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
   .m-body textarea{min-height:38vh}
   .m-foot{padding:12px 14px}
   /* 成品列表：长中文名换行，不再单行截断 */
-  .dl-list .file{flex-wrap:wrap;padding:10px 12px;gap:6px}
-  .dl-list .file .n{flex:1 1 100%;white-space:normal;word-break:break-all;line-height:1.4}
-  .dl-list .file .m{flex:none;font-size:11px}
+  .dl-list .file{padding:10px 12px;gap:7px}
+  .dl-list .file .fs{margin-top:3px}
+  .dl-list .file .f-ops{padding-left:0}
+  .dl-list .file .m{font-size:11px}
   .dl-list .file a{padding:4px 2px;font-size:14px}
   #toast{top:62px;padding:9px 14px;font-size:12.5px;max-width:94vw}
   .modal{width:96vw;max-height:90vh}
@@ -252,13 +265,20 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
     <!-- 拒答待处理（仅在存在拒答项时显示） -->
     <div class="sect" id="refusalSect" style="display:none">
       <h3>🚫 拒答待处理<span class="cnt" id="refusalCnt">0</span></h3>
-      <div class="hint" style="margin-bottom:8px">后台运行时被模型拒答的部分已留空并登记在此：点开可查看实际发送内容与拒答原文，修改后重新提交补写，或跳过保持空白。</div>
+      <div class="hint" style="margin-bottom:8px">后台运行时被模型拒答的部分已留空并登记在此：点开可查看实际发送内容与拒答原文，改后「重新提交」补写；若打算从某章重跑（那些章会被重新生成），直接「忽略并删除」即可，记录删掉不影响正文。</div>
       <div class="dl-list" id="refusalList"></div>
+      <button class="link-btn" id="refIgnoreAll" style="margin:8px 0 0" title="忽略并删除全部拒答记录（空白章保持空白，可从对应阶段重跑）">忽略全部</button>
     </div>
 
     <!-- 成品 -->
     <div class="sect" data-page-node-id="ltI3gDHEDaFwUycvDHiPdD">
-      <h3 data-page-node-id="7iMzXQkeHk3tLPcLmrkRrv">📁 已生成小说<button class="mini-btn" id="btnRefreshFiles" title="刷新成品列表" data-page-node-id="miniRefresh">⟳</button></h3>
+      <h3 data-page-node-id="7iMzXQkeHk3tLPcLmrkRrv">📁 已生成小说
+        <span class="hdr-actions">
+          <button class="mini-btn" id="btnSelAll" title="全选 / 取消全选" style="display:none">☑</button>
+          <button class="link-btn" id="btnDelSel" title="删除勾选的成品文件" style="display:none;margin-left:0">🗑 删除所选</button>
+          <button class="mini-btn" id="btnRefreshFiles" title="刷新成品列表" data-page-node-id="miniRefresh">⟳</button>
+        </span>
+      </h3>
       <div class="dl-list" id="fileList" data-page-node-id="Qzn2Np2RoaT8gRvPbUGXg7"><div class="hint" data-page-node-id="RwQm4XdlJkg9LjcKqK8jVt">暂无</div></div>
     </div>
   </aside>
@@ -440,12 +460,14 @@ function applyStatus(st){
 // ── 拒答待处理列表 ──
 function renderRefusals(list){
   list = list || [];
+  S._refusalList = list;
   const sig = list.map(r=>r.id).join(',');
   if(sig === S._refusalSig) return;      // 列表未变不重绘（流式期间每帧推送，重绘会致闪烁/点击失效）
   S._refusalSig = sig;
   const el = $('refusalList');
   $('refusalCnt').textContent = list.length;
   $('refusalSect').style.display = list.length ? '' : 'none';
+  if(!list.length) disarmIgnoreAll();    // 清空后按钮的「待确认」状态要复位
   el.innerHTML = list.map(r=>
     `<div class="ref-item" data-id="${esc(r.id)}">
        <div class="t">🚫 ${esc(r.label || r.stage || '拒答项')}</div>
@@ -470,13 +492,15 @@ function openRefusalModal(item){
   $('cTitle').textContent = '拒答待处理：' + (item.label || item.stage || '');
   $('cPrompt').textContent =
     '模型连续拒答 3 次后留空。下方为**当初实际发送的内容**（可修改，例如弱化敏感表述），'
-    + '点「重新提交」即用它补写该部分；「跳过」则保持空白并移除本项。\n'
+    + '点「重新提交」即用它补写该部分。\n'
+    + '「忽略并删除」会直接删掉这条记录（空白章保持空白）——打算从某章重跑、'
+    + '后面的正文会被重新生成时，用它清理即可。\n'
     + '──────── 模型拒答原文 ────────\n' + (item.refusal_text || '（空）');
   $('cPrompt').classList.add('refusal');
   $('cText').value = item.prompt || '';
   $('cConfirm').textContent = '重新提交';
   $('cConfirm').disabled = !support;
-  $('cRe').textContent = '跳过（留空）';
+  $('cRe').textContent = '忽略并删除';
   $('cCancel').textContent = '关闭';
   $('cCount').textContent = '';
   $('cTip').textContent = support
@@ -547,11 +571,32 @@ async function sendConfirm(action, edited){
 $('cConfirm').onclick = ()=>sendConfirm(
   activeConfirm && activeConfirm.source === 'refusal' ? 'resubmit' : 'confirm');
 $('cRe').onclick = ()=>sendConfirm(
-  activeConfirm && activeConfirm.source === 'refusal' ? 'skip' : 'regenerate');
+  activeConfirm && activeConfirm.source === 'refusal' ? 'ignore' : 'regenerate');
 $('cCancel').onclick = ()=>{
   if(!activeConfirm) return closeConfirm();
   if(activeConfirm.source === 'refusal') return sendConfirm('close');
   return sendConfirm(activeConfirm.kind === 'refusal' ? 'skip' : 'cancel');
+};
+
+// ── 忽略全部拒答记录（两段式点击，防误删） ──
+let _ignoreAllTimer = null;
+function disarmIgnoreAll(){
+  clearTimeout(_ignoreAllTimer); _ignoreAllTimer = null;
+  const b = $('refIgnoreAll'); if(!b) return;
+  b.classList.remove('armed'); b.textContent = '忽略全部';
+}
+$('refIgnoreAll').onclick = async ()=>{
+  const b = $('refIgnoreAll');
+  const n = (S._refusalList || []).length;
+  if(!n) return toast('当前没有待处理的拒答项');
+  if(!_ignoreAllTimer){
+    b.classList.add('armed'); b.textContent = `确认忽略 ${n} 项？`;
+    _ignoreAllTimer = setTimeout(disarmIgnoreAll, 4000);
+    return;
+  }
+  disarmIgnoreAll();
+  const r = await (await api('/api/refusals/clear',{method:'POST',body:'{}'})).json();
+  toast(r.message, !r.ok);
 };
 
 // ── 标签切换 ──
@@ -706,23 +751,86 @@ function resetViews(){
 }
 
 // ── 成品文件列表 ──
+// 勾选态取自 DOM（列表每次刷新都重建，不另存状态，避免与真实文件脱节）
+function pickedFiles(){
+  return [...document.querySelectorAll('#fileList .fs:checked')].map(c=>c.dataset.name);
+}
+function syncFileBtns(){
+  const boxes = [...document.querySelectorAll('#fileList .fs')];
+  const n = boxes.filter(c=>c.checked).length;
+  const del = $('btnDelSel'), all = $('btnSelAll');
+  del.style.display = n ? '' : 'none';
+  del.textContent = n ? `🗑 删除所选(${n})` : '🗑 删除所选';
+  all.style.display = boxes.length ? '' : 'none';
+}
+
+async function deleteFiles(names){
+  if(!names.length) return;
+  let d;
+  try{
+    d = await (await api('/api/files/delete', {method:'POST', body:JSON.stringify({names})})).json();
+  }catch(e){
+    if(e.message !== 'unauthorized') toast('删除请求失败：'+e.message, true);
+    return;
+  }
+  if(d.deleted && d.deleted.length) toast(`已删除 ${d.deleted.length} 个成品文件`);
+  if(d.failed && d.failed.length)
+    toast(`${d.failed.length} 个未删除：` + d.failed.map(f=>`${f.name}（${f.error}）`).join('；'), true);
+  refreshFiles();
+}
+
 async function refreshFiles(){
   try{
     const d = await (await api('/api/files')).json();
     const el = $('fileList');
-    if(!d.files.length){ el.innerHTML='<div class="hint">暂无成品</div>'; return; }
+    if(!d.files.length){ el.innerHTML='<div class="hint">暂无成品</div>'; syncFileBtns(); return; }
     el.innerHTML = d.files.map(f=>
-      `<div class="file"><span class="n">📄 ${f.name}</span>
-       <span class="m">${fmtSize(f.size)}</span>
-       <a href="/api/download/${encodeURIComponent(f.name)}">下载</a></div>`
+      `<div class="file">
+         <div class="f-top">
+           <input type="checkbox" class="fs" data-name="${esc(f.name)}" title="勾选后可批量删除">
+           <span class="n" title="${esc(f.name)}">📄 ${esc(f.name)}</span>
+         </div>
+         <div class="f-ops">
+           <span class="m">${fmtSize(f.size)}</span>
+           <a href="/api/download/${encodeURIComponent(f.name)}">下载</a>
+           <button class="del-btn" data-name="${esc(f.name)}" title="删除该文件（不可恢复）">删除</button>
+         </div>
+       </div>`
     ).join('');
+    syncFileBtns();
   }catch(e){}
 }
+
+// ── 成品删除交互（列表靠 innerHTML 重建，故用事件委托）──
+$('btnRefreshFiles').onclick = ()=>refreshFiles();
+$('btnSelAll').onclick = ()=>{
+  const boxes = [...document.querySelectorAll('#fileList .fs')];
+  if(!boxes.length) return;
+  const target = boxes.filter(c=>c.checked).length < boxes.length;   // 未全选 → 全选；已全选 → 清空
+  boxes.forEach(c=>{ c.checked = target; });
+  syncFileBtns();
+};
+$('btnDelSel').onclick = ()=>{
+  const names = pickedFiles();
+  if(!names.length) return;
+  const list = names.length > 8 ? names.slice(0,8).join('\n') + `\n…等 ${names.length} 个` : names.join('\n');
+  if(!confirm(`确定删除以下 ${names.length} 个成品文件？此操作不可恢复。\n\n${list}`)) return;
+  deleteFiles(names);
+};
+$('fileList').addEventListener('click', e=>{
+  const btn = e.target.closest('.del-btn');
+  if(!btn) return;
+  const name = btn.dataset.name;
+  if(!confirm(`确定删除该成品文件？此操作不可恢复。\n\n${name}`)) return;
+  deleteFiles([name]);
+});
+$('fileList').addEventListener('change', e=>{
+  if(e.target.classList && e.target.classList.contains('fs')) syncFileBtns();
+});
 
 // ── 启动 ──
 loadCfg();
 connectWS();
-$('btnRefreshFiles').onclick = ()=>refreshFiles();
 </script>
 </body>
 </html>

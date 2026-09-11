@@ -300,6 +300,20 @@ class JobManager:
             self._bump()
         return changed
 
+    def clear_refusals(self) -> int:
+        """忽略并删除全部拒答待处理项，返回删掉的条数。
+
+        用于「从某章重跑」之前清理：那些章会被重新生成，旧记录已无意义；
+        记录只描述当初发出去的内容，删掉不会动正文（空白章仍然空白）。
+        """
+        with self._lock:
+            n = len(self.refusals)
+            self.refusals = []
+        if n:
+            save_refusals([])
+            self._bump()
+        return n
+
     # ── 日志 / 状态拉取 ──
 
     def get_logs_since(self, since_seq: int) -> dict:
@@ -431,6 +445,19 @@ class JobManager:
     def set_has_resume(self, val: bool):
         with self._lock:
             self.task["has_resume"] = val
+        self._bump()
+
+    def forget_result_file(self, names) -> None:
+        """成品文件被删除后，清掉状态里对它的引用。
+
+        否则状态仍会声称成品是 <已删除的文件>，前端据此的刷新/展示会指向不存在的文件。
+        """
+        gone = set(names or [])
+        if not gone:
+            return
+        with self._lock:
+            if self.task.get("result_file") in gone:
+                self.task["result_file"] = ""
         self._bump()
 
     def reset_before_run(self):
