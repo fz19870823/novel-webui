@@ -26,6 +26,7 @@ class GeneratorWorker:
                  base_url: str, model: str,
                  chapters_count=None, words_per_chapter=None,
                  single_chapter_scene=None, single_chapter_write=None,
+                 fallback_config: dict = None,
                  resume: bool = False):
         self.theme = theme
         self.requirements = requirements
@@ -37,6 +38,8 @@ class GeneratorWorker:
         # None = 未指定（续传时回落到断点里记录的粒度）
         self.single_chapter_scene = single_chapter_scene
         self.single_chapter_write = single_chapter_write
+        # 本地无审查兜底 API（None = 引擎侧回落断点/禁用）
+        self.fallback_config = fallback_config
         self.resume = resume
 
         self._thread = None
@@ -104,6 +107,7 @@ class GeneratorWorker:
                 words_per_chapter=self.words_per_chapter,
                 single_chapter_scene=self.single_chapter_scene,
                 single_chapter_write=self.single_chapter_write,
+                fallback_config=self.fallback_config,
             )
 
             story = self._generator.run(start_stage=start_stage)
@@ -166,12 +170,13 @@ class RefusalResolver:
     """
 
     def __init__(self, item: dict, prompt: str, api_key: str,
-                 base_url: str, model: str):
+                 base_url: str, model: str, fallback_config: dict = None):
         self.item = dict(item or {})
         self.prompt = prompt or ""
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
+        self.fallback_config = fallback_config
         self._thread = None
         self._generator = None
 
@@ -242,6 +247,7 @@ class RefusalResolver:
                 content_callback=manager.cb_content,
                 refusal_callback=None,
                 resume_state=state,
+                fallback_config=self.fallback_config,
             )
             gen = self._generator
 

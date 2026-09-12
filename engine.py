@@ -23,6 +23,7 @@ from openai import OpenAI
 from config import (
     load_config, DEFAULT_BASE_URL, DEFAULT_MODEL,
     DEFAULT_WORDS_PER_CHAPTER, DEFAULT_WORDS_PER_SCENE,
+    DEFAULT_FALLBACK_CTX_LIMIT,
 )
 from state import save_resume_state, load_resume_state
 
@@ -35,6 +36,11 @@ RETRY_MAX = 3
 SCENE_REVISE_MAX = 2
 STREAM_IDLE_TIMEOUT = 10.0
 FIRST_CONTENT_TIMEOUT = 30.0
+
+# 本地无审查兜底 API：本地模型上下文短、长提示词预处理（prompt eval）慢，
+# 首块与块间超时都要比云端放宽，否则会被误判为无响应。
+FALLBACK_FIRST_TIMEOUT = 300.0
+FALLBACK_IDLE_TIMEOUT = 60.0
 
 # 模型拒答的强特征短语（内容质量闸用，命中即判失败）。
 # 只保留"非对话语境下几乎必然代表拒答"的组合词，避免误伤正文里自然出现的单字词。
@@ -120,7 +126,8 @@ class NovelGenerator:
                  chapters_count: int = None,
                  words_per_chapter: int = None,
                  single_chapter_scene: bool = None,
-                 single_chapter_write: bool = None):
+                 single_chapter_write: bool = None,
+                 fallback_config: dict = None):
         self.theme = theme
         self.requirements = requirements
         self.api_key = api_key
@@ -158,6 +165,17 @@ class NovelGenerator:
             single_chapter_write = _rcfg.get("single_chapter_write", _legacy)
         self.single_chapter_scene = bool(single_chapter_scene)
         self.single_chapter_write = bool(single_chapter_write)
+
+        # 本地无审查兜底 API（模型连续拒答时自动启用补写）。
+        # 三态回落：显式传入 > 断点里记录的 > 空（禁用）。
+        _fb = fallback_config if fallback_config is not None else (_rcfg.get("fallback") or {})
+        self.fallback_url = (_fb.get("url") or "").strip()
+        self.fallback_key = (_fb.get("key") or "").strip()
+        self.fallback_model = (_fb.get("model") or "").strip()
+        try:
+            self.fallback_ctx_limit = max(2000, int(_fb.get("ctx_limit") or DEFAULT_FALLBACK_CTX_LIMIT))
+        except (TypeError, ValueError):
+            self.fallback_ctx_limit = DEFAULT_FALLBACK_CTX_LIMIT
 
         # 自适应批大小（正文单章模式下禁用升级，chunk_size 恒为 1）
         self.chunk_size = 1
@@ -231,6 +249,59 @@ class NovelGenerator:
     def _init_client(self):
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url,
                              default_headers={"User-Agent": "Mozilla/5.0"})
+        # 兜底客户端（OpenAI 兼容：llama.cpp / LM Studio / Ollama 等）；未配置则保持 None
+        self.local_client = None
+        if self.fallback_url:
+            self.local_client = OpenAI(
+                api_key=self.fallback_key or "none",
+                base_url=self.fallback_url,
+                default_headers={"User-Agent": "Mozilla/5.0"})
+            self._log(f"🔌 本地无审查兜底已启用: {self.fallback_model or '(服务默认模型)'} @ {self.fallback_url} "
+                      f"(上下文≈{self.fallback_ctx_limit}字)")
+
+    def _iter_stream(self, stream, idle_timeout: float, first_timeout: float):
+        """带空闲超时的流式读取：首个文本块等待 first_timeout 秒，
+        之后块间最多 idle_timeout 秒，超时抛 TimeoutError（call_grok 与本地兜底共用）。"""
+        chunk_queue = queue.Queue()
+        stop_event = threading.Event()
+        first_content_received = False
+
+        def reader():
+            try:
+                for chunk in stream:
+                    if stop_event.is_set():
+                        break
+                    chunk_queue.put(("chunk", chunk))
+                chunk_queue.put(("done", None))
+            except Exception as exc:
+                chunk_queue.put(("error", exc))
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+
+        while True:
+            if not self.is_running:
+                stop_event.set()
+                raise Exception("用户停止生成")
+            try:
+                if first_content_received:
+                    kind, payload = chunk_queue.get(timeout=idle_timeout)
+                else:
+                    kind, payload = chunk_queue.get(timeout=first_timeout)
+            except queue.Empty:
+                if first_content_received:
+                    stop_event.set()
+                    raise TimeoutError(f"流式输出连续{idle_timeout:g}秒无新内容")
+                stop_event.set()
+                raise TimeoutError(f"首个流式文本等待超过{first_timeout:g}秒")
+            if kind == "chunk":
+                if getattr(payload.choices[0].delta, "content", None):
+                    first_content_received = True
+                yield payload
+            elif kind == "done":
+                return
+            elif kind == "error":
+                raise payload
 
     # ── 断点管理 ──
 
@@ -247,7 +318,12 @@ class NovelGenerator:
                     "base_url": self.base_url,
                     "model": self.model,
                     "single_chapter_scene": self.single_chapter_scene,
-                    "single_chapter_write": self.single_chapter_write
+                    "single_chapter_write": self.single_chapter_write,
+                    "fallback": {
+                        "url": self.fallback_url,
+                        "model": self.fallback_model,
+                        "ctx_limit": self.fallback_ctx_limit
+                    }
                 },
                 "stage": stage,
                 "layer4_batch": layer4_batch,
@@ -324,48 +400,6 @@ class NovelGenerator:
             head = text[:-window]
             return tail in head
 
-        def iter_stream_with_idle_timeout(stream, idle_timeout: float, first_timeout: float):
-            chunk_queue = queue.Queue()
-            stop_event = threading.Event()
-            first_content_received = False
-
-            def reader():
-                try:
-                    for chunk in stream:
-                        if stop_event.is_set():
-                            break
-                        chunk_queue.put(("chunk", chunk))
-                    chunk_queue.put(("done", None))
-                except Exception as exc:
-                    chunk_queue.put(("error", exc))
-
-            thread = threading.Thread(target=reader, daemon=True)
-            thread.start()
-
-            while True:
-                if not self.is_running:
-                    stop_event.set()
-                    raise Exception("用户停止生成")
-                try:
-                    if first_content_received:
-                        kind, payload = chunk_queue.get(timeout=idle_timeout)
-                    else:
-                        kind, payload = chunk_queue.get(timeout=first_timeout)
-                except queue.Empty:
-                    if first_content_received:
-                        stop_event.set()
-                        raise TimeoutError(f"流式输出连续{idle_timeout:g}秒无新内容")
-                    stop_event.set()
-                    raise TimeoutError(f"首个流式文本等待超过{first_timeout:g}秒")
-                if kind == "chunk":
-                    if getattr(payload.choices[0].delta, "content", None):
-                        first_content_received = True
-                    yield payload
-                elif kind == "done":
-                    return
-                elif kind == "error":
-                    raise payload
-
         for attempt in range(RETRY_MAX):
             if not self.is_running:
                 raise Exception("用户停止生成")
@@ -380,7 +414,7 @@ class NovelGenerator:
                     stream=True
                 )
 
-                for chunk in iter_stream_with_idle_timeout(stream, STREAM_IDLE_TIMEOUT, FIRST_CONTENT_TIMEOUT):
+                for chunk in self._iter_stream(stream, STREAM_IDLE_TIMEOUT, FIRST_CONTENT_TIMEOUT):
                     if not self.is_running:
                         raise Exception("用户停止生成")
                     if chunk.choices[0].delta.content:
@@ -421,10 +455,15 @@ class NovelGenerator:
                         time.sleep(2 ** attempt)
                         continue
 
-                    # ── 自动重试 3 次仍拒答：一律登记到「拒答待处理」列表并留空 ──
-                    # 不再区分有没有前端在线、也不向前端弹交互窗：统一登记，
+                    # ── 自动重试 3 次仍拒答：先试本地无审查兜底 API ──
+                    # 兜底成功 → 直接采用本地产出；兜底未配置/失败 → 一律登记到
+                    # 「拒答待处理」列表并留空（不区分前端是否在线），
                     # 用户上线后在列表里查看发送内容与拒答原文，改后重新提交或忽略删除。
-                    self._log("📌 模型连续拒答，登记为拒答待处理项，本次调用留空")
+                    self._log("📌 模型连续拒答，尝试本地无审查兜底 API 补写…")
+                    fb_content = self._call_fallback(prompt, max_tokens, temperature, show_stream)
+                    if fb_content:
+                        return fb_content
+                    self._log("📌 本地兜底未配置或失败，登记为拒答待处理项，本次调用留空")
                     self._record_refusal(prompt, content)
                     raise RefusalSkipped(content, prompt)
 
@@ -473,6 +512,95 @@ class NovelGenerator:
                     time.sleep(wait_sec)
                 else:
                     raise
+        return ""
+
+    # ── 本地无审查兜底 ──
+
+    def _compress_prompt(self, prompt: str) -> str:
+        """用主 API 把超长提示词压缩到本地兜底上下文预算内。失败返回 ""。
+
+        压缩要求保留：写作任务与硬性指标（字数、@@第N章@@ 等格式标记）、
+        人物/情节要点、与上文衔接所需信息；丢弃重复与次要细节。
+        """
+        target = max(2000, int(self.fallback_ctx_limit * 0.6))
+        instr = (f"你是提示词压缩器。把下面这段小说创作提示词压缩到约{target}字以内，"
+                 "必须保留：写作任务与硬性要求（如每章字数、@@第N章@@ 等格式标记）、"
+                 "人物设定与情节要点、与上文衔接所需的信息。丢弃重复内容与次要细节，"
+                 "不要输出任何解释，直接给出压缩后的提示词。")
+        for attempt in range(2):
+            if not self.is_running:
+                raise Exception("用户停止生成")
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": f"{instr}\n\n{prompt}"}],
+                    temperature=0.2,
+                    max_tokens=max(2000, target),
+                    timeout=180,
+                    stream=False)
+                out = (resp.choices[0].message.content or "").strip()
+                if out:
+                    if _count_text_len(out) > self.fallback_ctx_limit:
+                        self._log(f"⚠️ 压缩后仍超预算({_count_text_len(out)}字)，硬截断到{self.fallback_ctx_limit}字")
+                        out = out[:self.fallback_ctx_limit]
+                    self.call_count += 1
+                    self._log(f"🗜 提示词已压缩：{len(prompt)}字符 → {len(out)}字符")
+                    return out
+                self._log(f"⚠️ 提示词压缩返回空内容 (第{attempt+1}/2次)")
+            except Exception as e:
+                if not self.is_running:
+                    raise Exception("用户停止生成")
+                self._log(f"⚠️ 提示词压缩失败 (第{attempt+1}/2次): {str(e)[:150]}")
+        return ""
+
+    def _call_fallback(self, prompt: str, max_tokens: int, temperature: float,
+                       show_stream: bool = True) -> str:
+        """用本地无审查兜底 API 重新生成当前调用。
+
+        提示词长度（CJK 字符 + 英文单词近似估算）超过 fallback_context_limit 时，
+        先用主 API 压缩再发送。成功返回正文；未配置/失败返回 ""（调用方继续走
+        拒答登记流程）。本方法自身不产生 RefusalSkipped。
+        """
+        if not (self.local_client and self.fallback_model):
+            return ""
+        send = prompt
+        if _count_text_len(prompt) > self.fallback_ctx_limit:
+            self._log(f"📏 提示词约{_count_text_len(prompt)}字，超过本地兜底上限"
+                      f"{self.fallback_ctx_limit}，先用主 API 压缩")
+            send = self._compress_prompt(prompt)
+            if not send:
+                self._log("⚠️ 提示词压缩失败，本地兜底放弃")
+                return ""
+        for attempt in range(2):
+            if not self.is_running:
+                raise Exception("用户停止生成")
+            content = ""
+            try:
+                stream = self.local_client.chat.completions.create(
+                    model=self.fallback_model,
+                    messages=[{"role": "user", "content": send}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    timeout=600,
+                    stream=True)
+                for chunk in self._iter_stream(stream, FALLBACK_IDLE_TIMEOUT, FALLBACK_FIRST_TIMEOUT):
+                    if not self.is_running:
+                        raise Exception("用户停止生成")
+                    if chunk.choices[0].delta.content:
+                        content += chunk.choices[0].delta.content
+                        if show_stream:
+                            self._update_content(content)
+                self.call_count += 1
+                if content and not _looks_like_refusal(content):
+                    self._log(f"✅ 本地兜底完成（{len(content)}字），累计调用 {self.call_count} 次")
+                    return content
+                self._log(f"⚠️ 本地兜底输出为空/疑似拒答 (第{attempt+1}/2次)")
+            except RefusalSkipped:
+                raise
+            except Exception as e:
+                if not self.is_running:
+                    raise Exception("用户停止生成")
+                self._log(f"⚠️ 本地兜底调用失败 (第{attempt+1}/2次): {str(e)[:150]}")
         return ""
 
     # ── 拒答登记 ──

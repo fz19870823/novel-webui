@@ -28,6 +28,9 @@ DEFAULT_WORDS_PER_SCENE = 280
 DEFAULT_TARGET_WORDS = 50000
 DEFAULT_CONFIRM_SECONDS = 5
 
+# 本地无审查兜底 API 默认上下文预算（字符近似；超出先由主 API 压缩再发送）
+DEFAULT_FALLBACK_CTX_LIMIT = 64000
+
 
 def _default_config() -> dict:
     return {
@@ -42,6 +45,12 @@ def _default_config() -> dict:
         # 批粒度开关（分解 / 正文分开控制）：True = 每次只处理一章
         "single_chapter_scene": False,   # layer3 场景分解：1 章/批（关 = 2 章/批）
         "single_chapter_write": False,   # layer4 正文写作：1 章/批 且不做批量升级
+        # 本地无审查兜底 API（模型连续拒答后用它补写被拒部分；url 留空 = 禁用）
+        "fallback_api_url": "",        # 如 http://127.0.0.1:1234/v1（llama.cpp/LM Studio/Ollama）
+        "fallback_api_key": "",        # 本地一般不需要；非空会加密落盘
+        "fallback_api_key_enc": False, # fallback_api_key 是否为 Fernet 密文
+        "fallback_model": "",
+        "fallback_context_limit": DEFAULT_FALLBACK_CTX_LIMIT,
     }
 
 
@@ -120,6 +129,10 @@ def load_config() -> dict:
             config["api_key"] = decrypt_api_key(config["api_key"])
         # 否则保留明文(旧文件)继续使用；下次保存会自动转为密文
 
+    # 兜底 Key 同样按密文解密
+    if config.get("fallback_api_key") and config.get("fallback_api_key_enc"):
+        config["fallback_api_key"] = decrypt_api_key(config["fallback_api_key"])
+
     # 环境变量优先覆盖
     env_key = os.environ.get("NOVEL_AI_API_KEY", "").strip()
     if env_key:
@@ -156,10 +169,21 @@ def save_config(config: dict):
         safe["api_key"] = ""
         safe["api_key_enc"] = False
 
+    # 兜底 Key：与主 Key 同一套加密落盘逻辑
+    fb_key = (safe.get("fallback_api_key") or "").strip()
+    if fb_key:
+        safe["fallback_api_key"] = encrypt_api_key(fb_key)
+        safe["fallback_api_key_enc"] = True
+    else:
+        safe["fallback_api_key"] = ""
+        safe["fallback_api_key_enc"] = False
+
     # 仅保留已知字段，避免历史残留噪音
     known = {"api_key", "api_key_enc", "base_url", "model", "theme",
              "requirements", "chapters_count", "words_per_chapter",
-             "single_chapter_scene", "single_chapter_write"}
+             "single_chapter_scene", "single_chapter_write",
+             "fallback_api_url", "fallback_api_key", "fallback_api_key_enc",
+             "fallback_model", "fallback_context_limit"}
     safe = {k: v for k, v in safe.items() if k in known}
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:

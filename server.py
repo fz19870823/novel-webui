@@ -25,7 +25,8 @@ from flask import (Flask, request, jsonify, send_from_directory, send_file,
 from flask_sock import Sock
 
 from config import (load_config, save_config, mask_api_key, DATA_DIR,
-                    DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_CONFIRM_SECONDS)
+                    DEFAULT_BASE_URL, DEFAULT_MODEL, DEFAULT_CONFIRM_SECONDS,
+                    DEFAULT_FALLBACK_CTX_LIMIT)
 from auth import (has_users as auth_has_users,
                   create_user as auth_create_user,
                   verify_user as auth_verify_user,
@@ -236,6 +237,23 @@ def _as_bool(v) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on", "是", "开")
 
 
+def _fallback_cfg(data: dict, cfg: dict) -> dict:
+    """合成本地无审查兑底 API 参数（请求体优先，其次全局配置）。
+
+    url 为空 = 禁用兑底（引擎侧据此回落）。key 只在内存传递，不进断点。
+    """
+    url = (data.get("fallback_api_url") or "").strip() or (cfg.get("fallback_api_url") or "").strip()
+    model = (data.get("fallback_model") or "").strip() or (cfg.get("fallback_model") or "").strip()
+    key = (data.get("fallback_api_key") or "").strip() or (cfg.get("fallback_api_key") or "").strip()
+    raw_limit = data.get("fallback_context_limit") or cfg.get("fallback_context_limit")
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        limit = DEFAULT_FALLBACK_CTX_LIMIT
+    return {"url": url, "model": model, "key": key,
+            "ctx_limit": max(2000, limit or DEFAULT_FALLBACK_CTX_LIMIT)}
+
+
 def _stage_info():
     """返回启动页需要的默认配置 + 可续传标记（不返回 key）。"""
     cfg = load_config()
@@ -248,6 +266,10 @@ def _stage_info():
         "words_per_chapter": cfg.get("words_per_chapter", ""),
         "single_chapter_scene": _as_bool(cfg.get("single_chapter_scene", False)),
         "single_chapter_write": _as_bool(cfg.get("single_chapter_write", False)),
+        "fallback_api_url": cfg.get("fallback_api_url", ""),
+        "fallback_model": cfg.get("fallback_model", ""),
+        "fallback_api_key_masked": mask_api_key(cfg.get("fallback_api_key", "")),
+        "fallback_context_limit": cfg.get("fallback_context_limit", DEFAULT_FALLBACK_CTX_LIMIT),
         "theme": cfg.get("theme", ""),
         "requirements": cfg.get("requirements", ""),
         "has_resume": load_resume_state() is not None,
@@ -413,6 +435,18 @@ def api_config_set():
     for bk in ("single_chapter_scene", "single_chapter_write"):
         if bk in data and data[bk] is not None:
             cfg[bk] = _as_bool(data[bk])
+    # 本地无审查兑底 API 配置
+    for fk in ("fallback_api_url", "fallback_model"):
+        if fk in data and data[fk] is not None:
+            cfg[fk] = str(data[fk]).strip()
+    if data.get("fallback_context_limit") is not None:
+        try:
+            cfg["fallback_context_limit"] = max(2000, int(data["fallback_context_limit"]))
+        except (TypeError, ValueError):
+            pass
+    new_fb_key = (data.get("fallback_api_key") or "").strip()
+    if new_fb_key:
+        cfg["fallback_api_key"] = new_fb_key   # 非空才写入，save_config 会加密落盘
     # API Key：非空才写入（会持久化到配置文件；有环境变量时文件不存明文，见 save_config 语义）
     new_key = (data.get("api_key") or "").strip()
     if new_key:
@@ -428,8 +462,12 @@ def api_test():
     key = (data.get("api_key") or "").strip() or load_config().get("api_key", "")
     base_url = (data.get("base_url") or "").strip() or DEFAULT_BASE_URL
     model = (data.get("model") or "").strip() or DEFAULT_MODEL
+    # local=true 表示测试本地兑底（OpenAI 兼容服务，无 Key 合法）
     if not key:
-        return jsonify({"ok": False, "message": "未填写 API Key"})
+        if _as_bool(data.get("local")):
+            key = "none"
+        else:
+            return jsonify({"ok": False, "message": "未填写 API Key"})
     try:
         client = OpenAI(api_key=key, base_url=base_url,
                         default_headers={"User-Agent": "Mozilla/5.0"})
@@ -512,6 +550,7 @@ def api_start():
         else _as_bool(cfg.get("single_chapter_scene", False))
     sc_write = _as_bool(data["single_chapter_write"]) if data.get("single_chapter_write") is not None \
         else _as_bool(cfg.get("single_chapter_write", False))
+    fb = _fallback_cfg(data, cfg)
 
     # 保存界面偏好（不含 key）
     save_config({**cfg, "theme": theme,
@@ -520,7 +559,10 @@ def api_start():
                  "chapters_count": str(cc) if cc else "",
                  "words_per_chapter": str(wpc) if wpc else "",
                  "single_chapter_scene": sc_scene,
-                 "single_chapter_write": sc_write})
+                 "single_chapter_write": sc_write,
+                 "fallback_api_url": fb["url"],
+                 "fallback_model": fb["model"],
+                 "fallback_context_limit": fb["ctx_limit"]})
 
     with _worker_lock:
         _worker = GeneratorWorker(
@@ -533,6 +575,7 @@ def api_start():
             words_per_chapter=wpc,
             single_chapter_scene=sc_scene,
             single_chapter_write=sc_write,
+            fallback_config=fb,
         )
         _worker.start()
     return jsonify({"ok": True, "message": "任务已启动（后台运行）"})
@@ -576,6 +619,7 @@ def api_resume():
         return _as_bool(cfg.get(key, False))
 
     sc_scene, sc_write = _pick_flag("single_chapter_scene"), _pick_flag("single_chapter_write")
+    fb = _fallback_cfg(data, cfg)
 
     with _worker_lock:
         _worker = GeneratorWorker(
@@ -586,6 +630,7 @@ def api_resume():
             model=model,
             single_chapter_scene=sc_scene,
             single_chapter_write=sc_write,
+            fallback_config=fb,
             resume=True,
         )
         _worker.start()
@@ -678,7 +723,8 @@ def api_refusal_resolve():
     edited = (data.get("edited") or "").strip() or item.get("prompt", "")
 
     with _worker_lock:
-        _worker = RefusalResolver(item, edited, key, base_url, model)
+        _worker = RefusalResolver(item, edited, key, base_url, model,
+                                  fallback_config=_fallback_cfg(data, cfg))
         _worker.start()
     return jsonify({"ok": True, "message": "已开始补写（后台运行，可用「停止」中止）"})
 

@@ -222,6 +222,13 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
         </div>
         <div class="hint" id="keyHint" data-page-node-id="42J2SrhsLsQ6TMuld7RfOl"></div>
       </div>
+      <div class="f"><label>兑底 API（本地无审查；连续拒答后自动补写，留空=禁用）</label><input id="fallback_url" placeholder="http://127.0.0.1:1234/v1"></div>
+      <div class="row">
+        <div class="f"><label>兑底 Model</label><input id="fallback_model" placeholder="本地模型名"></div>
+        <div class="f"><label>上下文上限（字）</label><input id="fallback_limit" type="number" min="2000" placeholder="64000"></div>
+      </div>
+      <div class="f"><label>兑底 API Key（本地服务一般留空）</label><input id="fallback_key" type="password" placeholder="留空即可"><div class="hint" id="fbHint"></div></div>
+      <div class="g2"><button class="btn ghost" id="btnTestFb">测试兑底连接</button></div>
       <div class="g2" data-page-node-id="WGlZMNUQueIR2VjeiENZn7">
         <button class="btn ghost" id="btnTest" data-page-node-id="wUY3DFhH6ObW2jHYQGoTW8">测试连接</button>
         <button class="btn ghost" id="btnModels" data-page-node-id="BZ41pwOxfy8Na35oyVgh5H">拉取模型列表</button>
@@ -358,6 +365,13 @@ async function loadCfg(){
   $('cc').value = c.chapters_count; $('wpc').value = c.words_per_chapter;
   $('scScene').checked = !!c.single_chapter_scene;
   $('scWrite').checked = !!c.single_chapter_write;
+  $('fallback_url').value = c.fallback_api_url || '';
+  $('fallback_model').value = c.fallback_model || '';
+  $('fallback_limit').value = c.fallback_context_limit || 64000;
+  $('fbHint').textContent = (c.fallback_api_url || '')
+    ? (c.fallback_api_key_masked && c.fallback_api_key_masked !== '未配置'
+        ? `兑底已启用，Key ${c.fallback_api_key_masked}` : '兑底已启用（无 Key）')
+    : '兑底未启用（URL 留空）';
   $('theme').value = c.theme; $('req').value = c.requirements;
   $('keyHint').textContent = c.api_key_env ? `🔒 已用环境变量 (${c.api_key_masked})`
     : c.api_key_masked !== '未配置' ? `已配置 (${c.api_key_masked})，可留空` : '⚠ 未配置 Key';
@@ -629,6 +643,15 @@ $('btnTest').onclick = async ()=>{
   const r = await (await api('/api/test',{method:'POST',body:JSON.stringify(f)})).json();
   r.ok?toast('连接成功：'+r.message):toast(r.message,true);
 };
+$('btnTestFb').onclick = async ()=>{
+  const f = readForm();
+  if(!f.fallback_api_url) return toast('请先填写兑底 Base URL',true);
+  toast('正在测试兑底连接…');
+  const r = await (await api('/api/test',{method:'POST',body:JSON.stringify({
+    base_url:f.fallback_api_url, model:f.fallback_model, api_key:f.fallback_api_key, local:true
+  })})).json();
+  r.ok?toast('兑底连接正常：'+(r.message||'OK')):toast(r.message,true);
+};
 $('btnModels').onclick = async ()=>{
   const f = readForm();
   toast('拉取模型列表…');
@@ -745,6 +768,10 @@ function readForm(){
     words_per_chapter: $('wpc').value,
     single_chapter_scene: $('scScene').checked,
     single_chapter_write: $('scWrite').checked,
+    fallback_api_url: $('fallback_url').value,
+    fallback_model: $('fallback_model').value,
+    fallback_api_key: $('fallback_key').value,
+    fallback_context_limit: $('fallback_limit').value,
   };
 }
 function resetViews(){
