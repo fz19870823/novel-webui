@@ -1,18 +1,19 @@
 # novel-webui · 小说远程生成器（WebUI）
 
-基于 **novel-ai**（Grok/xAI 四层递进生成管线 + 自适应优化）的**远程可操作 Web 版**。
-引擎代码从 novel-ai 复制而来，本仓库为完全独立项目。
+基于 Grok/xAI 的四层递进生成管线（设定圣经 → 章节大纲 → 场景分解 → 正文写作 + 自适应优化），
+**完全独立的项目**：自带后端服务、前端页面、鉴权与断点体系，不依赖任何桌面端程序。
 
-## 与桌面版(GUI)的关键差异
+## 核心能力
 
-| 能力 | PySide6 桌面版 | novel-webui |
-|---|---|---|
-| 界面 | 桌面窗口 | 浏览器（本机/局域网/远程均可） |
-| 后台运行 | 依赖窗口常开 | **后端常驻，提交任务后关闭页面也能跑完** |
-| 实时流式正文 | 窗口内 | WebSocket 实时推送刷新 |
-| 各层确认 | 模态对话框 | 页面弹窗 + 倒计时自动确认 |
-| 断点续传 | 按钮 | 一键继续上次生成（**场景分解阶段也能续传**） |
-| 访问控制 | 无 | **内置登录鉴权**（首次启动设置账号 + 初始化口令） |
+| 能力 | 说明 |
+|---|---|
+| 界面 | 浏览器（本机/局域网/远程均可） |
+| 后台运行 | **后端常驻，提交任务后关闭页面也能跑完** |
+| 实时流式正文 | WebSocket 实时推送刷新 |
+| 各层确认 | 页面弹窗 + 倒计时自动确认 |
+| 断点续传 | 一键继续上次生成（**场景分解阶段也能续传**） |
+| 拒答兜底 | 连续拒答自动改用**本地无审查模型**补写；兜底不可用才登记待处理项 |
+| 访问控制 | **内置登录鉴权**（首次启动设置账号 + 初始化口令） |
 
 ## 快速开始
 
@@ -90,8 +91,8 @@ novel-webui/
 ├── auth.py            ← 首次初始化口令 / 账号校验 / 登录限流 / session 密钥持久化
 ├── controller.py      ← 线程安全任务中枢 / 待确认项 / 日志环形缓冲 / 变更通知
 ├── worker.py          ← 后台生成线程（驱动 NovelGenerator）
-├── engine.py          ← 生成引擎（复制自 novel-ai）
-├── config.py          ← 配置管理（复制，Key 不落盘）
+├── engine.py          ← 生成引擎（四层递进管线 + 拒答兜底调度）
+├── config.py          ← 配置管理（API Key 经 Fernet 加密落盘，不出现明文）
 ├── state.py           ← 断点管理（进度文件 + 章节/静态分片，见下）
 ├── static/index.html  ← 单页前端（WebSocket 推送）
 ├── static/login.html  ← 登录页
@@ -106,12 +107,13 @@ novel-webui/
 运行期数据目录（`NOVEL_DATA_DIR`，默认=代码目录；容器内 `/data`）内会生成：
 
 ```
-novel_generator_config.json     配置（API Key 为 Fernet 密文，环境变量注入时文件留空）
+novel_generator_config.json     配置（主/兜底 API Key 均为 Fernet 密文，环境变量注入时文件留空）
 .model_secret                   Fernet 密钥
 auth_users.json / .session_secret / .setup_token   鉴权凭据与密钥
 novel_resume_state.json         断点进度（小文件，每次保存都写）
 novel_resume_static/<hash>.json 断点静态部分（大纲/场景/设定圣经，内容不变则复用）
 novel_resume_chapters/<hash>.json 断点章节正文分片（内容寻址）
+novel_refusals.json             拒答待处理列表（含发送内容与拒答原文）
 <标题>_YYYYMMDD_HHMMSS.txt      生成的小说成品
 ```
 
@@ -121,7 +123,8 @@ novel_resume_chapters/<hash>.json 断点章节正文分片（内容寻址）
   ——① 倒计时结束自动确认原文；② 前端在截止前提交 确认(可编辑)/重新生成/取消。
   因此即使没有任何浏览器在线，流程也会自动推进到底。
 - **纯后端完成**：生成全程在 `worker` 线程跑，Flask 只做状态存取，前端经 `/ws` 实时推送。
-- **API Key 安全**：与 novel-ai 一致，Key 不写盘，优先环境变量 `NOVEL_AI_API_KEY`。
+- **API Key 安全**：Key 优先由环境变量 `NOVEL_AI_API_KEY` 注入（此时配置文件留空）；
+  页面填写的 Key 经 Fernet 加密后落盘，文件里不出现明文。
 - **同一时刻仅一个任务**：/api/start 有并发锁，防重复提交。
 - **内置鉴权**：除首次初始化/登录页与对应 4 个 API 外，所有页面、`/api/*`、`/ws`
   均需登录（session cookie）；凭据与签名密钥落在数据目录，重启不丢。
@@ -133,6 +136,28 @@ novel_resume_chapters/<hash>.json 断点章节正文分片（内容寻址）
   且元信息为原子写（临时文件 + rename），崩溃不会留下半截 JSON。
 - **实时推送节流**：引擎每个流式 chunk 都会触发变更通知，服务端按最小帧间隔（100ms）合并，
   最多 10 帧/秒，避免逐 token 全量推送；空闲每 15s 发心跳保活。
+
+## 本地无审查兜底 API
+
+主 API 连续拒答 3 次后，自动改用**本地无审查模型**补写当前部分：
+兜底成功即直接采用本地产出（不登记拒答）；兜底未配置或失败，才照旧登记进「拒答待处理」列表。
+
+配置项（页面「API 配置」区，或配置文件同名键）：
+
+| 键 | 说明 |
+|---|---|
+| `fallback_api_url` | OpenAI 兼容地址，如 `http://127.0.0.1:1234/v1`（llama.cpp / LM Studio / Ollama 等）；**留空 = 禁用兜底** |
+| `fallback_model` | 本地模型名 |
+| `fallback_api_key` | 本地服务通常留空；非空同样 Fernet 加密落盘 |
+| `fallback_context_limit` | 本地上下文预算，默认 **64000**（按 CJK 字符 + 英文词近似估算） |
+
+- **超长提示词先压缩**：提示词超过 `fallback_context_limit` 时，先用主 API 压缩
+  （保留字数等硬性要求、`@@第N章@@` 格式标记、人物与情节要点），再发送给本地模型；
+  压缩失败或仍超限则放弃兜底，回落到拒答登记。
+- 本地模型 prompt eval 慢，兜底调用单独放宽超时（首块 300s / 块间 60s），
+  且输出同样过质量闸（空内容或疑似拒答会重试一次）。
+- 断点里会记录兜底配置（不含 Key），续传与「拒答待处理」重新提交补写同样生效。
+- 页面「测试兜底连接」按钮对应 `POST /api/test` 的 `local:true`（本地服务无 Key 也合法）。
 
 ## Docker 部署
 
@@ -211,7 +236,7 @@ example.com {
 | POST | `/api/login` · `/api/logout` | 登录 · 退出（失败超限返回 429） |
 | GET  | `/api/config` | 读取配置(不含 Key) |
 | POST | `/api/config` | 保存配置 |
-| POST | `/api/test` | 测试连接 |
+| POST | `/api/test` | 测试连接（`local:true` 时测本地兜底，允许无 Key） |
 | POST | `/api/models` | 拉取模型列表 |
 | POST | `/api/start` | 提交新生成任务 |
 | POST | `/api/resume` | 断点续传 |
