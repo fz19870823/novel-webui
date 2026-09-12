@@ -11,12 +11,16 @@ v2.0 优化：
 """
 
 import json
+import os
 import time
 import re
+import socket
+import ipaddress
 import queue
 import threading
 from datetime import datetime
 from typing import List, Dict, Optional, Callable
+from urllib.parse import urlsplit
 
 from openai import OpenAI
 
@@ -110,6 +114,134 @@ class RefusalSkipped(Exception):
         self.prompt = prompt or ""
 
 
+# ── OpenAI 兼容服务：地址规范化 / 代理判定 / 客户端构造 ──
+# 兜底 API 既可能是本机 Ollama，也可能是**其他机器上的自建服务**
+# （Ollama / LM Studio / llama.cpp / vLLM / one-api / new-api ...），统一按 OpenAI 兼容协议处理。
+
+PROXY_MODES = ("auto", "direct", "system")
+
+
+def normalize_proxy_mode(value) -> str:
+    """代理模式收敛到 auto / direct / system（非法值回落 auto）。"""
+    v = ("" if value is None else str(value)).strip().lower()
+    return v if v in PROXY_MODES else "auto"
+
+
+def normalize_openai_base_url(url: str) -> str:
+    """规范化 OpenAI 兼容 base_url：补协议头、去尾部斜杠、路径为空时补 /v1。
+
+    SDK 把 `/chat/completions` 拼在 base_url 后面，而自建服务几乎都挂在 `/v1` 之下；
+    用户常只填 `http://192.168.1.50:11434`，硬拼出来是 `.../chat/completions` → 404。
+    显式写了路径的（`/v1`、`/openai/v1`）原样保留，不做猜测。
+    """
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if "://" not in u:
+        u = "http://" + u
+    u = u.rstrip("/")
+    try:
+        if urlsplit(u).path in ("", "/"):
+            u += "/v1"
+    except Exception:
+        pass
+    return u
+
+
+def _is_private_host(host: str) -> bool:
+    """回环 / 私网 / 链路本地地址（字面量 IP）。"""
+    h = (host or "").strip().strip("[]")
+    if not h:
+        return False
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return bool(ip.is_loopback or ip.is_private or ip.is_link_local)
+
+
+def _resolve_host_ips(host: str, timeout: float = 3.0):
+    """带超时的 DNS 解析（放子线程，避免污染全局 socket 默认超时）。失败返回空集。"""
+    box = {"ips": set()}
+
+    def run():
+        try:
+            box["ips"] = {info[4][0] for info in socket.getaddrinfo(host, None)
+                          if info and len(info) > 4 and info[4]}
+        except Exception:
+            box["ips"] = set()
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(timeout)
+    return box["ips"]
+
+
+def is_direct_target(url: str) -> bool:
+    """该地址是否应**绕过代理直连**（本机 / 内网服务）。
+
+    先看主机名启发式（回环、私网字面量、无点短名、.local/.lan/.internal），
+    再对域名做一次 DNS 解析 —— 覆盖「内网域名解析到 192.168.5.x」这类场景。
+    公网地址返回 False（照常走系统/环境代理）。
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    try:
+        host = urlsplit(raw if "://" in raw else "http://" + raw).hostname or ""
+    except Exception:
+        return False
+    h = host.strip().strip("[]").lower()
+    if not h:
+        return False
+    if h == "localhost" or h.endswith((".local", ".lan", ".internal", ".localhost")):
+        return True
+    if _is_private_host(h):
+        return True
+    if "." not in h:
+        return True                       # 无点短名（容器名 / DNS 短名）视为内网
+    ips = _resolve_host_ips(h)
+    return bool(ips) and any(_is_private_host(ip) for ip in ips)
+
+
+def build_openai_client(api_key: str, base_url: str, proxy_mode: str = "auto"):
+    """构造 OpenAI 兼容客户端（兜底/自建服务与云端主 API 通用）。
+
+    proxy_mode：
+      auto   —— 内网/本机地址直连，公网地址照常走系统代理（默认）
+      direct —— 强制直连，绝不走代理
+      system —— 强制遵循系统/环境代理
+
+    为什么 auto 要区分对待：Windows 上 `urllib.request.getproxies()` 会读到 WinINET
+    系统代理（本机指向 Clash 127.0.0.1:7890），openai SDK 默认 `trust_env=True` 会照做 ——
+    连 `http://127.0.0.1:11434`（Ollama）也被送进代理，代理回连不了本地服务 → 502（实测）。
+    反过来，公网自建服务在本机直连出网不通（github:443 直连实测 code=000），必须走代理。
+    所以既不能一律 trust_env=False，也不能一律走代理。
+    """
+    mode = normalize_proxy_mode(proxy_mode)
+    normalized = normalize_openai_base_url(base_url)
+    kwargs = {"api_key": api_key or "none", "base_url": normalized,
+              "default_headers": {"User-Agent": "Mozilla/5.0"}}
+    direct = (mode == "direct") or (mode == "auto" and is_direct_target(normalized))
+    if direct:
+        try:
+            from openai import DefaultHttpxClient
+            kwargs["http_client"] = DefaultHttpxClient(trust_env=False)
+        except Exception:
+            # 老版本 openai 没有 DefaultHttpxClient：退化为「让代理跳过这些主机」
+            try:
+                host = urlsplit(normalized).hostname or ""
+            except Exception:
+                host = ""
+            for env_key in ("NO_PROXY", "no_proxy"):
+                hosts = [x.strip() for x in (os.environ.get(env_key) or "").split(",") if x.strip()]
+                for extra in ("127.0.0.1", "localhost", "::1", host):
+                    if extra and extra not in hosts:
+                        hosts.append(extra)
+                os.environ[env_key] = ",".join(hosts)
+    return OpenAI(**kwargs)
+
+
 # ==============================
 #  NovelGenerator 核心引擎
 # ==============================
@@ -166,12 +298,13 @@ class NovelGenerator:
         self.single_chapter_scene = bool(single_chapter_scene)
         self.single_chapter_write = bool(single_chapter_write)
 
-        # 本地无审查兜底 API（模型连续拒答时自动启用补写）。
+        # 无审查兜底 API（模型连续拒答时自动启用补写；可指向其他机器的自建服务）。
         # 三态回落：显式传入 > 断点里记录的 > 空（禁用）。
         _fb = fallback_config if fallback_config is not None else (_rcfg.get("fallback") or {})
         self.fallback_url = (_fb.get("url") or "").strip()
         self.fallback_key = (_fb.get("key") or "").strip()
         self.fallback_model = (_fb.get("model") or "").strip()
+        self.fallback_proxy = normalize_proxy_mode(_fb.get("proxy"))
         try:
             self.fallback_ctx_limit = max(2000, int(_fb.get("ctx_limit") or DEFAULT_FALLBACK_CTX_LIMIT))
         except (TypeError, ValueError):
@@ -249,15 +382,17 @@ class NovelGenerator:
     def _init_client(self):
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url,
                              default_headers={"User-Agent": "Mozilla/5.0"})
-        # 兜底客户端（OpenAI 兼容：llama.cpp / LM Studio / Ollama 等）；未配置则保持 None
+        # 兜底客户端（OpenAI 兼容：Ollama / LM Studio / llama.cpp / vLLM 等，可跨机器）；未配置则保持 None
         self.local_client = None
         if self.fallback_url:
-            self.local_client = OpenAI(
-                api_key=self.fallback_key or "none",
-                base_url=self.fallback_url,
-                default_headers={"User-Agent": "Mozilla/5.0"})
-            self._log(f"🔌 本地无审查兜底已启用: {self.fallback_model or '(服务默认模型)'} @ {self.fallback_url} "
-                      f"(上下文≈{self.fallback_ctx_limit}字)")
+            # 代理策略见 build_openai_client：内网/本机直连（否则 127.0.0.1 会被系统代理吃掉变 502），
+            # 公网自建服务照常走系统代理（本机直连出网不通）。
+            self.local_client = build_openai_client(self.fallback_key, self.fallback_url,
+                                                    self.fallback_proxy)
+            _mode_cn = {"auto": "自动", "direct": "直连", "system": "系统代理"}[self.fallback_proxy]
+            self._log(f"🔌 兜底 API 已启用: {self.fallback_model or '(服务默认模型)'} @ "
+                      f"{normalize_openai_base_url(self.fallback_url)} "
+                      f"(上下文≈{self.fallback_ctx_limit}字，代理={_mode_cn})")
 
     def _iter_stream(self, stream, idle_timeout: float, first_timeout: float):
         """带空闲超时的流式读取：首个文本块等待 first_timeout 秒，
@@ -322,7 +457,8 @@ class NovelGenerator:
                     "fallback": {
                         "url": self.fallback_url,
                         "model": self.fallback_model,
-                        "ctx_limit": self.fallback_ctx_limit
+                        "ctx_limit": self.fallback_ctx_limit,
+                        "proxy": self.fallback_proxy
                     }
                 },
                 "stage": stage,
@@ -455,15 +591,15 @@ class NovelGenerator:
                         time.sleep(2 ** attempt)
                         continue
 
-                    # ── 自动重试 3 次仍拒答：先试本地无审查兜底 API ──
+                    # ── 自动重试 3 次仍拒答：先试兜底 API（可指向其他机器的自建服务）──
                     # 兜底成功 → 直接采用本地产出；兜底未配置/失败 → 一律登记到
                     # 「拒答待处理」列表并留空（不区分前端是否在线），
                     # 用户上线后在列表里查看发送内容与拒答原文，改后重新提交或忽略删除。
-                    self._log("📌 模型连续拒答，尝试本地无审查兜底 API 补写…")
+                    self._log("📌 模型连续拒答，尝试兜底 API 补写…")
                     fb_content = self._call_fallback(prompt, max_tokens, temperature, show_stream)
                     if fb_content:
                         return fb_content
-                    self._log("📌 本地兜底未配置或失败，登记为拒答待处理项，本次调用留空")
+                    self._log("📌 兜底 API 未配置或失败，登记为拒答待处理项，本次调用留空")
                     self._record_refusal(prompt, content)
                     raise RefusalSkipped(content, prompt)
 
@@ -514,10 +650,10 @@ class NovelGenerator:
                     raise
         return ""
 
-    # ── 本地无审查兜底 ──
+    # ── 无审查兜底 API（OpenAI 兼容，可跨机器）──
 
     def _compress_prompt(self, prompt: str) -> str:
-        """用主 API 把超长提示词压缩到本地兜底上下文预算内。失败返回 ""。
+        """用主 API 把超长提示词压缩到兜底服务上下文预算内。失败返回 ""。
 
         压缩要求保留：写作任务与硬性指标（字数、@@第N章@@ 等格式标记）、
         人物/情节要点、与上文衔接所需信息；丢弃重复与次要细节。
@@ -555,7 +691,7 @@ class NovelGenerator:
 
     def _call_fallback(self, prompt: str, max_tokens: int, temperature: float,
                        show_stream: bool = True) -> str:
-        """用本地无审查兜底 API 重新生成当前调用。
+        """用兜底 API（OpenAI 兼容，可为其他机器的自建服务）重新生成当前调用。
 
         提示词长度（CJK 字符 + 英文单词近似估算）超过 fallback_context_limit 时，
         先用主 API 压缩再发送。成功返回正文；未配置/失败返回 ""（调用方继续走
@@ -565,11 +701,11 @@ class NovelGenerator:
             return ""
         send = prompt
         if _count_text_len(prompt) > self.fallback_ctx_limit:
-            self._log(f"📏 提示词约{_count_text_len(prompt)}字，超过本地兜底上限"
+            self._log(f"📏 提示词约{_count_text_len(prompt)}字，超过兜底服务上限"
                       f"{self.fallback_ctx_limit}，先用主 API 压缩")
             send = self._compress_prompt(prompt)
             if not send:
-                self._log("⚠️ 提示词压缩失败，本地兜底放弃")
+                self._log("⚠️ 提示词压缩失败，兜底放弃")
                 return ""
         for attempt in range(2):
             if not self.is_running:
@@ -592,15 +728,18 @@ class NovelGenerator:
                             self._update_content(content)
                 self.call_count += 1
                 if content and not _looks_like_refusal(content):
-                    self._log(f"✅ 本地兜底完成（{len(content)}字），累计调用 {self.call_count} 次")
+                    self._log(f"✅ 兜底 API 完成补写（{len(content)}字），累计调用 {self.call_count} 次")
                     return content
-                self._log(f"⚠️ 本地兜底输出为空/疑似拒答 (第{attempt+1}/2次)")
+                self._log(f"⚠️ 兜底 API 输出为空/疑似拒答 (第{attempt+1}/2次)")
             except RefusalSkipped:
                 raise
             except Exception as e:
                 if not self.is_running:
                     raise Exception("用户停止生成")
-                self._log(f"⚠️ 本地兜底调用失败 (第{attempt+1}/2次): {str(e)[:150]}")
+                msg = str(e)
+                if "404" in msg:
+                    msg += "（自建服务多挂在 /v1 下，请检查兜底地址，如 http://主机:端口/v1）"
+                self._log(f"⚠️ 兜底 API 调用失败 (第{attempt+1}/2次): {msg[:200]}")
         return ""
 
     # ── 拒答登记 ──

@@ -16,8 +16,9 @@
 html,body{height:100%}
 body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;overflow:hidden}
 button{font-family:inherit;cursor:pointer;border:none;border-radius:8px}
-input,textarea{font-family:inherit;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 12px;outline:none;font-size:14px;min-width:0;overflow-wrap:anywhere}
-input:focus,textarea:focus{border-color:var(--accent)}
+input,textarea,select{font-family:inherit;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 12px;outline:none;font-size:14px;min-width:0;overflow-wrap:anywhere}
+input:focus,textarea:focus,select:focus{border-color:var(--accent)}
+select{cursor:pointer}
 textarea{resize:vertical;line-height:1.6}
 
 /* ── 顶栏 ── */
@@ -152,7 +153,7 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
   aside .sect h3 .num{display:none}   /* 顺序已变，隐藏编号圆圈避免误导 */
   .view{min-height:52vh}              /* 正文区在自动高度布局下保留可视高度 */
   /* ≥16px 防 iOS Safari 聚焦输入框时自动放大页面 */
-  input,textarea,.btn,.combobox input{font-size:16px}
+  input,textarea,select,.btn,.combobox input{font-size:16px}
 }
 /* 手机竖屏微调 */
 @media (max-width: 560px){
@@ -222,13 +223,30 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
         </div>
         <div class="hint" id="keyHint" data-page-node-id="42J2SrhsLsQ6TMuld7RfOl"></div>
       </div>
-      <div class="f"><label>兑底 API（本地无审查；连续拒答后自动补写，留空=禁用）</label><input id="fallback_url" placeholder="http://127.0.0.1:1234/v1"></div>
+      <div class="f"><label>兜底 API（OpenAI 兼容；连续拒答后自动补写，留空=禁用。可指向其他机器的自建服务）</label><input id="fallback_url" placeholder="http://127.0.0.1:11434/v1（Ollama）或 http://192.168.1.50:8000/v1（远端）"></div>
+      <div class="f"><label>兜底 Model（可下拉选择或手动输入）</label>
+        <div class="combobox">
+          <input id="fallback_model" placeholder="如 qwen3:14b" autocomplete="off">
+          <button type="button" class="cb-toggle" id="fbCbToggle" title="显示全部模型" tabindex="-1">▾</button>
+          <ul class="cb-list" id="fbCbList" role="listbox" hidden></ul>
+        </div>
+      </div>
       <div class="row">
-        <div class="f"><label>兑底 Model</label><input id="fallback_model" placeholder="本地模型名"></div>
+        <div class="f"><label>兜底 API Key（自建服务一般留空）</label><input id="fallback_key" type="password" placeholder="留空即可"></div>
         <div class="f"><label>上下文上限（字）</label><input id="fallback_limit" type="number" min="2000" placeholder="64000"></div>
       </div>
-      <div class="f"><label>兑底 API Key（本地服务一般留空）</label><input id="fallback_key" type="password" placeholder="留空即可"><div class="hint" id="fbHint"></div></div>
-      <div class="g2"><button class="btn ghost" id="btnTestFb">测试兑底连接</button></div>
+      <div class="f"><label>代理模式（兜底在别的机器时按需调整）</label>
+        <select id="fallback_proxy">
+          <option value="auto">自动：内网/本机直连，公网走系统代理</option>
+          <option value="direct">强制直连：不走任何代理</option>
+          <option value="system">强制走系统/环境代理</option>
+        </select>
+      </div>
+      <div class="hint" id="fbHint"></div>
+      <div class="g2">
+        <button class="btn ghost" id="btnTestFb">测试兜底连接</button>
+        <button class="btn ghost" id="btnFbModels">拉取兜底模型</button>
+      </div>
       <div class="g2" data-page-node-id="WGlZMNUQueIR2VjeiENZn7">
         <button class="btn ghost" id="btnTest" data-page-node-id="wUY3DFhH6ObW2jHYQGoTW8">测试连接</button>
         <button class="btn ghost" id="btnModels" data-page-node-id="BZ41pwOxfy8Na35oyVgh5H">拉取模型列表</button>
@@ -336,8 +354,8 @@ pre{flex:1;overflow:auto;padding:0 16px 16px;font-family:var(--mono);font-size:1
 <script>
 // ── 常量与状态 ──
 let S = { running:false, stopping:false, wsUp:false, confirmTimer:null,
-          confirmSeen:null, cfgLoaded:false, currentTab:'content', cfg:null, models:[],
-          modelIdx:-1, lastFile:'', lastContent:'', refusalCount:-1 };
+          confirmSeen:null, cfgLoaded:false, currentTab:'content', cfg:null,
+          lastFile:'', lastContent:'', refusalCount:-1 };
 const $ = id => document.getElementById(id);
 const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const api = (path, opts) => fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts))
@@ -368,10 +386,11 @@ async function loadCfg(){
   $('fallback_url').value = c.fallback_api_url || '';
   $('fallback_model').value = c.fallback_model || '';
   $('fallback_limit').value = c.fallback_context_limit || 64000;
+  $('fallback_proxy').value = c.fallback_proxy || 'auto';
   $('fbHint').textContent = (c.fallback_api_url || '')
     ? (c.fallback_api_key_masked && c.fallback_api_key_masked !== '未配置'
-        ? `兑底已启用，Key ${c.fallback_api_key_masked}` : '兑底已启用（无 Key）')
-    : '兑底未启用（URL 留空）';
+        ? `兜底已启用，Key ${c.fallback_api_key_masked}` : '兜底已启用（无 Key）')
+    : '兜底未启用（URL 留空）';
   $('theme').value = c.theme; $('req').value = c.requirements;
   $('keyHint').textContent = c.api_key_env ? `🔒 已用环境变量 (${c.api_key_masked})`
     : c.api_key_masked !== '未配置' ? `已配置 (${c.api_key_masked})，可留空` : '⚠ 未配置 Key';
@@ -645,95 +664,112 @@ $('btnTest').onclick = async ()=>{
 };
 $('btnTestFb').onclick = async ()=>{
   const f = readForm();
-  if(!f.fallback_api_url) return toast('请先填写兑底 Base URL',true);
-  toast('正在测试兑底连接…');
+  if(!f.fallback_api_url) return toast('请先填写兜底 Base URL',true);
+  toast('正在测试兜底连接…');
   const r = await (await api('/api/test',{method:'POST',body:JSON.stringify({
-    base_url:f.fallback_api_url, model:f.fallback_model, api_key:f.fallback_api_key, local:true
+    base_url:f.fallback_api_url, model:f.fallback_model, api_key:f.fallback_api_key,
+    fallback_proxy:f.fallback_proxy, local:true
   })})).json();
-  r.ok?toast('兑底连接正常：'+(r.message||'OK')):toast(r.message,true);
+  r.ok?toast('兜底连接正常：'+(r.message||'OK')):toast(r.message,true);
 };
+function dedupeModels(list){
+  const seen = new Set();
+  return (list||[]).filter(Boolean).filter(m=>seen.has(m)?false:(seen.add(m),true));
+}
+
+// ── Model 下拉(自定义，不受浏览器过滤，可完整展示 + 手动输入) ──
+// 工厂：主 API 与兜底 API 各一个实例，模型列表与高亮索引各自独立，互不干扰
+function mkModelCombo(ids){
+  const input = $(ids.input), list = $(ids.list), toggle = $(ids.toggle);
+  const st = { models: [], idx: -1 };
+  function render(filter){
+    const kw = (filter||'').trim().toLowerCase();
+    const items = kw ? st.models.filter(m=>m.toLowerCase().includes(kw)) : st.models;
+    list.innerHTML = '';
+    st.idx = -1;
+    if(!items.length){
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = st.models.length ? '无匹配模型' : '（尚未拉取，点“拉取模型列表”）';
+      list.appendChild(li);
+      return;
+    }
+    items.forEach(m=>{
+      const li = document.createElement('li');
+      li.textContent = m; li.dataset.val = m;
+      li.addEventListener('mousedown', e=>{ e.preventDefault(); select(m); });
+      list.appendChild(li);
+    });
+  }
+  function select(m){ input.value = m; close(); }
+  // 不传参数 = 按当前输入过滤；显式传 '' = 展示全部（拉取完/点开时用）
+  function open(filter){ render(filter === undefined ? input.value : filter); list.hidden = false; }
+  function close(){ list.hidden = true; st.idx = -1; }
+  toggle.onclick = e=>{
+    e.stopPropagation();
+    if(list.hidden){
+      input.value = '';            // 清空当前内容，便于手动输入后过滤查找
+      render('');
+      list.hidden = false;
+      input.focus();
+    } else close();
+  };
+  input.addEventListener('focus', ()=>{ render(''); list.hidden=false; });
+  input.addEventListener('input', ()=>{ if(!list.hidden) render(input.value); });
+  input.addEventListener('click', ()=>{ if(list.hidden){ render(''); list.hidden=false; } });
+  input.addEventListener('keydown', e=>{
+    if(e.key==='Escape'){ close(); return; }
+    if(e.key==='ArrowDown'||e.key==='ArrowUp'){
+      e.preventDefault();
+      if(list.hidden) open('');
+      const items = list.querySelectorAll('li:not(.empty)');
+      if(!items.length) return;
+      const d = e.key==='ArrowDown'?1:-1;
+      st.idx = (st.idx + d + items.length) % items.length;
+      items.forEach((li,i)=>li.classList.toggle('sel', i===st.idx));
+      if(st.idx>=0) items[st.idx].scrollIntoView({block:'nearest'});
+      return;
+    }
+    if(e.key==='Enter'){
+      if(list.hidden) return;
+      const items2 = list.querySelectorAll('li:not(.empty)');
+      if(st.idx>=0 && items2[st.idx]){ select(items2[st.idx].dataset.val); }
+      else if(items2.length===1){ select(items2[0].dataset.val); }
+    }
+  });
+  return { input, open, close,
+           setModels: arr=>{ st.models = arr || []; },
+           models: ()=>st.models };
+}
+const mainCombo = mkModelCombo({input:'model', toggle:'cbToggle', list:'cbList'});
+const fbCombo = mkModelCombo({input:'fallback_model', toggle:'fbCbToggle', list:'fbCbList'});
+
 $('btnModels').onclick = async ()=>{
   const f = readForm();
   toast('拉取模型列表…');
   const r = await (await api('/api/models',{method:'POST',body:JSON.stringify(f)})).json();
   if(!r.ok) return toast(r.message,true);
-  const raw = (r.models||[]).filter(Boolean);
-  // 去重
-  const seen = new Set();
-  S.models = raw.filter(m=>seen.has(m)?false:(seen.add(m),true));
+  mainCombo.setModels(dedupeModels(r.models));
   // 当前输入为空时，默认选中第一个
-  if(!$('model').value.trim() && S.models.length) $('model').value = S.models[0];
-  openModelList('');   // 拉取后直接展开下拉列表
+  if(!mainCombo.input.value.trim() && mainCombo.models().length) mainCombo.input.value = mainCombo.models()[0];
+  mainCombo.open('');   // 拉取后直接展开下拉列表
 };
-
-// ── Model 下拉(自定义，不受浏览器过滤，可完整展示 + 手动输入) ──
-const modelInput = $('model'), cbList = $('cbList');
-function renderModelList(filter){
-  const kw = (filter||'').trim().toLowerCase();
-  const list = kw ? S.models.filter(m=>m.toLowerCase().includes(kw)) : S.models;
-  cbList.innerHTML = '';
-  S.modelIdx = -1;
-  if(!list.length){
-    const li = document.createElement('li');
-    li.className = 'empty';
-    li.textContent = S.models.length ? '无匹配模型' : '（尚未拉取，点"拉取模型列表"）';
-    cbList.appendChild(li);
-    return;
-  }
-  list.forEach(m=>{
-    const li = document.createElement('li');
-    li.textContent = m; li.dataset.val = m;
-    li.addEventListener('mousedown', e=>{ e.preventDefault(); selectModel(m); });
-    cbList.appendChild(li);
-  });
-  // 记录当前完整(过滤后)列表供键盘导航
-  S._curList = list;
-}
-function selectModel(m){
-  modelInput.value = m;
-  closeModelList();
-}
-function openModelList(filter){
-  renderModelList(filter||modelInput.value);
-  cbList.hidden = false;
-}
-function closeModelList(){
-  cbList.hidden = true; S.modelIdx = -1;
-}
-$('cbToggle').onclick = e=>{
-  e.stopPropagation();
-  if(cbList.hidden){
-    modelInput.value = '';            // 清空当前内容，便于手动输入后过滤查找
-    renderModelList('');
-    cbList.hidden = false;
-    modelInput.focus();
-  } else closeModelList();
+$('btnFbModels').onclick = async ()=>{
+  const f = readForm();
+  if(!f.fallback_api_url) return toast('请先填写兜底 Base URL',true);
+  toast('拉取兜底模型列表…');
+  const r = await (await api('/api/models',{method:'POST',body:JSON.stringify({
+    base_url: f.fallback_api_url, api_key: f.fallback_api_key,
+    fallback_proxy: f.fallback_proxy, local: true
+  })})).json();
+  if(!r.ok) return toast(r.message,true);
+  fbCombo.setModels(dedupeModels(r.models));
+  if(!fbCombo.input.value.trim() && fbCombo.models().length) fbCombo.input.value = fbCombo.models()[0];
+  fbCombo.open('');
+  toast(`已拉取 ${fbCombo.models().length} 个兜底模型`);
 };
-modelInput.addEventListener('focus', ()=>{ renderModelList(''); cbList.hidden=false; });
-modelInput.addEventListener('input', ()=>{ if(!cbList.hidden) renderModelList(modelInput.value); });
-modelInput.addEventListener('click', ()=>{ if(cbList.hidden){ renderModelList(''); cbList.hidden=false; } });
-modelInput.addEventListener('keydown', e=>{
-  if(e.key==='Escape'){ closeModelList(); return; }
-  if(e.key==='ArrowDown'||e.key==='ArrowUp'){
-    e.preventDefault();
-    if(cbList.hidden) openModelList('');
-    const items = cbList.querySelectorAll('li:not(.empty)');
-    if(!items.length) return;
-    const d = e.key==='ArrowDown'?1:-1;
-    S.modelIdx = (S.modelIdx + d + items.length) % items.length;
-    items.forEach((li,i)=>li.classList.toggle('sel', i===S.modelIdx));
-    if(S.modelIdx>=0) items[S.modelIdx].scrollIntoView({block:'nearest'});
-    return;
-  }
-  if(e.key==='Enter'){
-    if(cbList.hidden) return;
-    const items2 = cbList.querySelectorAll('li:not(.empty)');
-    if(S.modelIdx>=0 && items2[S.modelIdx]){ selectModel(items2[S.modelIdx].dataset.val); }
-    else if(items2.length===1){ selectModel(items2[0].dataset.val); }
-  }
-});
 document.addEventListener('click', e=>{
-  if(!e.target.closest('.combobox')) closeModelList();
+  if(!e.target.closest('.combobox')){ mainCombo.close(); fbCombo.close(); }
 });
 $('btnStart').onclick = async ()=>{
   if(!S.cfgLoaded) return;
@@ -772,6 +808,7 @@ function readForm(){
     fallback_model: $('fallback_model').value,
     fallback_api_key: $('fallback_key').value,
     fallback_context_limit: $('fallback_limit').value,
+    fallback_proxy: $('fallback_proxy').value,
   };
 }
 function resetViews(){

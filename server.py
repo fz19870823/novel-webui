@@ -15,8 +15,6 @@ import os
 import threading
 import time
 import json
-import urllib.request
-import urllib.error
 from datetime import timedelta
 from urllib.parse import urlparse
 
@@ -39,6 +37,8 @@ from auth import (has_users as auth_has_users,
 from state import load_resume_state
 from controller import manager, LOG_RETURN
 from worker import GeneratorWorker, RefusalResolver
+from engine import (build_openai_client, normalize_openai_base_url,
+                    normalize_proxy_mode)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -238,20 +238,23 @@ def _as_bool(v) -> bool:
 
 
 def _fallback_cfg(data: dict, cfg: dict) -> dict:
-    """合成本地无审查兑底 API 参数（请求体优先，其次全局配置）。
+    """合成无审查兜底 API 参数（请求体优先，其次全局配置）。
 
-    url 为空 = 禁用兑底（引擎侧据此回落）。key 只在内存传递，不进断点。
+    地址是 OpenAI 兼容的任意端点：本机 Ollama，或**其他机器**上的自建服务
+    （vLLM / LM Studio / llama.cpp / one-api ...）。url 为空 = 禁用兜底（引擎侧据此回落）。
+    key 只在内存传递，不进断点。
     """
     url = (data.get("fallback_api_url") or "").strip() or (cfg.get("fallback_api_url") or "").strip()
     model = (data.get("fallback_model") or "").strip() or (cfg.get("fallback_model") or "").strip()
     key = (data.get("fallback_api_key") or "").strip() or (cfg.get("fallback_api_key") or "").strip()
+    proxy = normalize_proxy_mode(data.get("fallback_proxy") or cfg.get("fallback_proxy"))
     raw_limit = data.get("fallback_context_limit") or cfg.get("fallback_context_limit")
     try:
         limit = int(raw_limit)
     except (TypeError, ValueError):
         limit = DEFAULT_FALLBACK_CTX_LIMIT
-    return {"url": url, "model": model, "key": key,
-            "ctx_limit": max(2000, limit or DEFAULT_FALLBACK_CTX_LIMIT)}
+    return {"url": normalize_openai_base_url(url), "model": model, "key": key,
+            "proxy": proxy, "ctx_limit": max(2000, limit or DEFAULT_FALLBACK_CTX_LIMIT)}
 
 
 def _stage_info():
@@ -270,6 +273,7 @@ def _stage_info():
         "fallback_model": cfg.get("fallback_model", ""),
         "fallback_api_key_masked": mask_api_key(cfg.get("fallback_api_key", "")),
         "fallback_context_limit": cfg.get("fallback_context_limit", DEFAULT_FALLBACK_CTX_LIMIT),
+        "fallback_proxy": normalize_proxy_mode(cfg.get("fallback_proxy")),
         "theme": cfg.get("theme", ""),
         "requirements": cfg.get("requirements", ""),
         "has_resume": load_resume_state() is not None,
@@ -435,10 +439,12 @@ def api_config_set():
     for bk in ("single_chapter_scene", "single_chapter_write"):
         if bk in data and data[bk] is not None:
             cfg[bk] = _as_bool(data[bk])
-    # 本地无审查兑底 API 配置
+    # 无审查兜底 API 配置（OpenAI 兼容，可指向其他机器的自建服务）
     for fk in ("fallback_api_url", "fallback_model"):
         if fk in data and data[fk] is not None:
             cfg[fk] = str(data[fk]).strip()
+    if data.get("fallback_proxy") is not None:
+        cfg["fallback_proxy"] = normalize_proxy_mode(data["fallback_proxy"])
     if data.get("fallback_context_limit") is not None:
         try:
             cfg["fallback_context_limit"] = max(2000, int(data["fallback_context_limit"]))
@@ -457,53 +463,64 @@ def api_config_set():
 
 @app.route("/api/test", methods=["POST"])
 def api_test():
-    from openai import OpenAI
     data = request.get_json(silent=True) or {}
-    key = (data.get("api_key") or "").strip() or load_config().get("api_key", "")
-    base_url = (data.get("base_url") or "").strip() or DEFAULT_BASE_URL
-    model = (data.get("model") or "").strip() or DEFAULT_MODEL
-    # local=true 表示测试本地兑底（OpenAI 兼容服务，无 Key 合法）
-    if not key:
-        if _as_bool(data.get("local")):
-            key = "none"
-        else:
-            return jsonify({"ok": False, "message": "未填写 API Key"})
+    # local=true = 测试兜底/自建服务（Ollama、vLLM、LM Studio，或**其他机器**上的
+    # OpenAI 兼容端点）：只用请求体里的 Key 与地址，不回落主配置
+    # （否则会把云端 Key 发到自建服务、或把空地址顶成云端地址）。
+    local = _as_bool(data.get("local"))
+    key = (data.get("api_key") or "").strip() or ("" if local else load_config().get("api_key", ""))
+    base_url = (data.get("base_url") or "").strip() or ("" if local else DEFAULT_BASE_URL)
+    model = (data.get("model") or "").strip() or ("" if local else DEFAULT_MODEL)
+    if local:
+        if not base_url:
+            return jsonify({"ok": False, "message": "未填写兜底 Base URL"})
+        if not model:
+            return jsonify({"ok": False, "message": "未填写兜底 Model"})
+        key = key or "none"          # 自建服务通常不校验 Key，SDK 需要一个非空值
+    elif not key:
+        return jsonify({"ok": False, "message": "未填写 API Key"})
+    # 兜底按所选代理模式（内网直连 / 公网走代理），主 API 沿用系统代理
+    proxy = normalize_proxy_mode(data.get("fallback_proxy")) if local else "system"
     try:
-        client = OpenAI(api_key=key, base_url=base_url,
-                        default_headers={"User-Agent": "Mozilla/5.0"})
+        client = build_openai_client(key, base_url, proxy)
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "回复OK"}],
-            max_tokens=10)
+            max_tokens=10,
+            timeout=20 if local else 60)      # 自建服务不可达时别把页面挂住
         return jsonify({"ok": True, "message": (resp.choices[0].message.content or "")})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)})
+        msg = str(e)
+        if "404" in msg:
+            msg += "（地址可能缺少 /v1，例如 http://192.168.1.50:8000/v1）"
+        return jsonify({"ok": False, "message": msg})
 
 
 @app.route("/api/models", methods=["POST"])
 def api_models():
     data = request.get_json(silent=True) or {}
-    key = (data.get("api_key") or "").strip() or load_config().get("api_key", "")
-    base_url = ((data.get("base_url") or "").strip() or DEFAULT_BASE_URL).rstrip("/")
-    if not base_url:
-        return jsonify({"ok": False, "message": "未填写 Base URL"})
+    # local=true = 兜底/自建服务（Ollama、vLLM、LM Studio … 可位于其他机器）：
+    # 只用请求体里的 Key，绝不回落到主 API Key，也不把空的 base_url 顶成云端地址。
+    local = _as_bool(data.get("local"))
+    key = (data.get("api_key") or "").strip() or ("" if local else load_config().get("api_key", ""))
+    raw_base = (data.get("base_url") or "").strip()
+    if local and not raw_base:
+        return jsonify({"ok": False, "message": "未填写兜底 Base URL"})
+    proxy = normalize_proxy_mode(data.get("fallback_proxy")) if local else "system"
     try:
-        req = urllib.request.Request(base_url + "/models")
-        req.add_header("Accept", "application/json")
-        req.add_header("User-Agent", "Mozilla/5.0")
-        if key:
-            req.add_header("Authorization", f"Bearer {key}")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        if isinstance(data, dict) and "data" in data:
-            ids = sorted(m["id"] for m in data["data"])
-        elif isinstance(data, list):
-            ids = sorted(m["id"] if isinstance(m, dict) else str(m) for m in data)
-        else:
-            raise ValueError("未识别的返回格式")
+        # 走同一个 OpenAI 兼容客户端：地址规范化（自动补 /v1）与代理策略和引擎保持一致
+        client = build_openai_client(key or ("none" if local else ""),
+                                     raw_base or DEFAULT_BASE_URL, proxy)
+        page = client.models.list()
+        ids = sorted({m.id for m in (getattr(page, "data", None) or []) if getattr(m, "id", None)})
+        if not ids:
+            raise ValueError("服务返回的模型列表为空")
         return jsonify({"ok": True, "models": ids})
     except Exception as e:
-        return jsonify({"ok": False, "message": str(e)})
+        msg = str(e)
+        if "404" in msg:
+            msg += "（地址可能缺少 /v1，例如 http://192.168.1.50:8000/v1）"
+        return jsonify({"ok": False, "message": msg})
 
 
 # ═══════════ API: 任务控制 ═══════════
@@ -562,7 +579,8 @@ def api_start():
                  "single_chapter_write": sc_write,
                  "fallback_api_url": fb["url"],
                  "fallback_model": fb["model"],
-                 "fallback_context_limit": fb["ctx_limit"]})
+                 "fallback_context_limit": fb["ctx_limit"],
+                 "fallback_proxy": fb["proxy"]})
 
     with _worker_lock:
         _worker = GeneratorWorker(

@@ -46,11 +46,13 @@ def _default_config() -> dict:
         "single_chapter_scene": False,   # layer3 场景分解：1 章/批（关 = 2 章/批）
         "single_chapter_write": False,   # layer4 正文写作：1 章/批 且不做批量升级
         # 本地无审查兜底 API（模型连续拒答后用它补写被拒部分；url 留空 = 禁用）
-        "fallback_api_url": "",        # 如 http://127.0.0.1:1234/v1（llama.cpp/LM Studio/Ollama）
-        "fallback_api_key": "",        # 本地一般不需要；非空会加密落盘
+        # 兜底 API（OpenAI 兼容：本机 Ollama，或**其他机器**上的自建服务；url 留空 = 禁用）
+        "fallback_api_url": "",        # 如 http://127.0.0.1:11434/v1 或 http://192.168.1.50:8000/v1
+        "fallback_api_key": "",        # 自建服务一般不需要；非空会加密落盘
         "fallback_api_key_enc": False, # fallback_api_key 是否为 Fernet 密文
         "fallback_model": "",
         "fallback_context_limit": DEFAULT_FALLBACK_CTX_LIMIT,
+        "fallback_proxy": "auto",      # auto=内网直连/公网走代理，direct=强制直连，system=强制走代理
     }
 
 
@@ -183,7 +185,7 @@ def save_config(config: dict):
              "requirements", "chapters_count", "words_per_chapter",
              "single_chapter_scene", "single_chapter_write",
              "fallback_api_url", "fallback_api_key", "fallback_api_key_enc",
-             "fallback_model", "fallback_context_limit"}
+             "fallback_model", "fallback_context_limit", "fallback_proxy"}
     safe = {k: v for k, v in safe.items() if k in known}
 
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
